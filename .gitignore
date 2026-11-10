@@ -7,8 +7,8 @@ __pycache__/
 build/
 dist/
 
-# Models, weights, benchmark outputs
-models/
+# Models, weights, benchmark outputs (root-level only: python/tandem/models is source code)
+/models/
 *.safetensors
 *.gguf
 benchmarks/results/
