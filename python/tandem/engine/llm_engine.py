@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import itertools
+import logging
+import time
+from typing import Any, Optional, Sequence, Union
+
+import torch
+from torch import nn
+
+from tandem.cache.block_allocator import BlockAllocator
+from tandem.cache.kv_cache import KVCache
+from tandem.cache.radix_cache import RadixCache
+from tandem.config import EngineConfig
+from tandem.engine.request import Request, RequestOutput, RequestStatus
+from tandem.executor.model_runner import ModelRunner
+from tandem.layers.attention import TorchAttentionBackend
+from tandem.layers.moe import LocalMoEExecutor
+from tandem.model_config import ModelConfig
+from tandem.models import build_model
+from tandem.models.loader import cast_parameters, load_weights
+from tandem.sampling_params import SamplingParams
+from tandem.scheduler.scheduler import Scheduler
+from tandem.spec.ngram import NgramProposer
+from tandem.utils import resolve_device, resolve_dtype
+
+logger = logging.getLogger(__name__)
+
+PromptType = Union[str, Sequence[int]]
+
+
+class LLMEngine:
+    """Synchronous engine: ``add_request`` + ``step`` (or ``generate`` for offline use)."""
+
+    def __init__(
+        self,
+        config: EngineConfig,
+        *,
+        model_config: Optional[ModelConfig] = None,
+        model: Optional[nn.Module] = None,
+        tokenizer: Any = None,
+        load_tokenizer: bool = True,
+    ) -> None:
+        self.config = config
+        self.model_config = model_config or ModelConfig.from_pretrained(config.model)
+        mc = self.model_config
+        self.device = resolve_device(config.device)
+        self.dtype = resolve_dtype(config.dtype, self.device, mc.torch_dtype)
+        if config.cpu_threads > 0:
+            torch.set_num_threads(config.cpu_threads)
+        torch.manual_seed(config.seed)
+        self.max_model_len = config.max_model_len or min(mc.max_position_embeddings, 32768)
+
+        # ---------------------------------------------------------------- model
+        if model is None:
+            model = build_model(mc, self.max_model_len)
+            cast_parameters(model, self.dtype)
+            load_weights(model, config.model)
+        else:
+            cast_parameters(model, self.dtype)
+        self.hybrid = config.hybrid.enabled and mc.is_moe
+        if self.hybrid:
+            self._place_for_hybrid(model)
+        else:
+            model.to(self.device)
+        self.model = model.eval()
+
+        # ------------------------------------------------------------- KV cache
+        bs = config.block_size
+        per_block = KVCache.bytes_per_block(mc.num_hidden_layers, bs, mc.num_key_value_heads, mc.head_dim, self.dtype)
+        num_blocks = config.num_kv_blocks or max(1, int(config.kv_cache_memory_gb * 2**30 // per_block))
+        self.kv_cache = KVCache(mc.num_hidden_layers, num_blocks, bs, mc.num_key_value_heads, mc.head_dim, self.dtype, self.device)
+        self.allocator = BlockAllocator(num_blocks)
+        self.radix = RadixCache(bs, self.allocator) if config.enable_prefix_caching else None
+        self.scheduler = Scheduler(
+            self.allocator, bs, config.max_num_seqs, config.max_num_batched_tokens, self.max_model_len, self.radix
+        )
+
+        # -------------------------------------------------------------- executors
+        self.moe_executor = self._build_moe_executor() if self.hybrid else LocalMoEExecutor()
+        self.runner = ModelRunner(self.model, self.kv_cache, bs, self.device, TorchAttentionBackend(), self.moe_executor)
+        spec = config.speculative
+        self.proposer = NgramProposer(spec.ngram_min, spec.ngram_max) if spec.enabled and spec.method == "ngram" else None
+        if spec.enabled and self.proposer is None:
+            raise NotImplementedError(f"speculative method {spec.method!r} is not implemented yet")
+
+        self.tokenizer = tokenizer
+        if self.tokenizer is None and load_tokenizer:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer or config.model)
+        self.requests: dict[str, Request] = {}
+        self._ids = itertools.count()
+        self.num_steps = 0
+        logger.info(
+            "engine ready: %s on %s/%s, %d KV blocks x %d tokens, hybrid=%s",
+            mc.architecture, self.device, self.dtype, num_blocks, bs, self.hybrid,
+        )
+
+    # ------------------------------------------------------------------ setup
+    def _place_for_hybrid(self, model: nn.Module) -> None:
+        """Everything but routed experts goes to the device; experts stay on the CPU."""
+        dev = self.device
+        model.rotary_emb.to(dev)
+        model.model.embed_tokens.to(dev)
+        model.model.norm.to(dev)
+        if model.lm_head is not None:
+            model.lm_head.to(dev)
+        for layer in model.model.layers:
+            layer.self_attn.to(dev)
+            layer.input_layernorm.to(dev)
+            layer.post_attention_layernorm.to(dev)
+            if layer.is_moe:
+                layer.mlp.gate.to(dev)
+            else:
+                layer.mlp.to(dev)
+
+    def _build_moe_executor(self):
+        from tandem.hybrid.moe_executor import HybridMoEExecutor
+        from tandem.planner.cost_model import ExpertCostModel
+        from tandem.planner.hardware import PRESETS, load_profile
+        from tandem.planner.placement import footprint, make_plan
+
+        hc = self.config.hybrid
+        hw = load_profile(hc.hw_profile)
+        if hw.gpu is None:  # CPU-only machine: simulate a GPU profile so the planner logic still runs
+            logger.warning("no GPU in hardware profile %r; using preset 'rtx4090-desktop' for cost estimates", hw.name)
+            hw = PRESETS["rtx4090-desktop"]
+        elem = torch.empty((), dtype=self.dtype).element_size()
+        fp = footprint(self.model_config)
+        slots = hc.gpu_expert_slots
+        if slots is None:
+            plan = make_plan(self.model_config, hw, bytes_per_param=elem, vram_budget_gb=hc.vram_budget_gb,
+                             kv_gb=self.config.kv_cache_memory_gb)
+            slots = plan.expert_slots_per_layer if plan.expert_slots_per_layer is not None else self.model_config.num_experts
+            logger.info("placement plan:\n%s", plan.explain())
+        cost = ExpertCostModel(hw, fp.expert, elem)
+        return HybridMoEExecutor(self.model.moe_blocks(), self.device, slots, cost, hc.cpu_threads, hc.reuse_bonus)
+
+    # ---------------------------------------------------------------- requests
+    def add_request(
+        self,
+        prompt: Optional[PromptType] = None,
+        sampling_params: Optional[SamplingParams] = None,
+        request_id: Optional[str] = None,
+        prompt_token_ids: Optional[Sequence[int]] = None,
+    ) -> str:
+        sp = sampling_params or SamplingParams()
+        text: Optional[str] = None
+        if prompt_token_ids is None:
+            if isinstance(prompt, str):
+                if self.tokenizer is None:
+                    raise ValueError("text prompts need a tokenizer")
+                text = prompt
+                prompt_token_ids = self.tokenizer.encode(prompt)
+            elif prompt is not None:
+                prompt_token_ids = list(prompt)
+            else:
+                raise ValueError("either prompt or prompt_token_ids is required")
+        if not prompt_token_ids:
+            raise ValueError("empty prompt")
+        if len(prompt_token_ids) >= self.max_model_len:
+            raise ValueError(f"prompt has {len(prompt_token_ids)} tokens; max_model_len is {self.max_model_len}")
+        rid = request_id or f"req-{next(self._ids)}"
+        if rid in self.requests:
+            raise ValueError(f"duplicate request id {rid}")
+        req = Request(rid, list(prompt_token_ids), sp, self.model_config.eos_token_ids, prompt=text)
+        if sp.seed is not None:
+            req.generator = torch.Generator(device=self.device).manual_seed(sp.seed)
+        self.requests[rid] = req
+        self.scheduler.add_request(req)
+        return rid
+
+    def abort_request(self, request_id: str) -> None:
+        req = self.requests.pop(request_id, None)
+        if req is not None and not req.finished:
+            self.scheduler.finish_request(req, RequestStatus.FINISHED_ABORTED)
+
+    def has_unfinished_requests(self) -> bool:
+        return self.scheduler.has_unfinished()
+
+    # -------------------------------------------------------------------- step
+    def step(self) -> list[RequestOutput]:
+        sched = self.scheduler.schedule()
+        if sched.is_empty:
+            return []
+        sampled = self.runner.execute(sched)
+        updated = self.scheduler.update_from_output(sched, sampled)
+        self.num_steps += 1
+        outputs = []
+        for req in updated:
+            delta_text = self._detokenize(req)
+            outputs.append(self._make_output(req, delta_text))
+            if req.finished:
+                self.requests.pop(req.request_id, None)
+        if self.proposer is not None:
+            self._propose_drafts()
+        return outputs
+
+    def _propose_drafts(self) -> None:
+        k = self.config.speculative.num_speculative_tokens
+        for req in self.scheduler.running:
+            if not req.is_decoding:
+                continue
+            cap = min(k, req.sampling_params.max_tokens - req.num_output_tokens - 1, self.max_model_len - req.num_tokens - 1)
+            req.spec_token_ids = self.proposer.propose(req.all_token_ids, cap) if cap > 0 else []
+
+    def _detokenize(self, req: Request) -> str:
+        if self.tokenizer is None:
+            return ""
+        text = self.tokenizer.decode(req.output_token_ids, skip_special_tokens=req.sampling_params.skip_special_tokens)
+        if not req.finished and text.endswith("�"):  # incomplete UTF-8 sequence: hold back
+            text = text[: len(req.output_text)] if len(text) > len(req.output_text) else req.output_text
+        stops = req.sampling_params.stop
+        if stops:
+            cut = min((pos for pos in (text.find(s) for s in stops) if pos >= 0), default=-1)
+            if cut >= 0:
+                text = text[:cut]
+                if not req.finished:
+                    self.scheduler.finish_request(req, RequestStatus.FINISHED_STOPPED)
+        req.output_text = text
+        delta = text[req.sent_text_len :]
+        req.sent_text_len = len(text)
+        return delta
+
+    def _make_output(self, req: Request, delta_text: str) -> RequestOutput:
+        metrics = {}
+        if req.first_token_time is not None:
+            metrics["ttft"] = req.first_token_time - req.arrival_time
+        if req.finished and req.finish_time is not None:
+            metrics["latency"] = req.finish_time - req.arrival_time
+            metrics["cached_tokens"] = req.num_cached_tokens
+            if req.num_draft_tokens:
+                metrics["spec_acceptance"] = req.num_accepted_tokens / req.num_draft_tokens
+        return RequestOutput(
+            request_id=req.request_id,
+            prompt_token_ids=req.prompt_token_ids,
+            output_token_ids=list(req.output_token_ids),
+            text=req.output_text,
+            delta_text=delta_text,
+            delta_token_ids=list(req.new_token_ids),
+            finished=req.finished,
+            finish_reason=req.finish_reason,
+            metrics=metrics,
+        )
+
+    # --------------------------------------------------------------- offline API
+    def generate(
+        self,
+        prompts: Sequence[PromptType],
+        sampling_params: Union[SamplingParams, Sequence[SamplingParams], None] = None,
+    ) -> list[RequestOutput]:
+        if sampling_params is None or isinstance(sampling_params, SamplingParams):
+            params = [sampling_params or SamplingParams()] * len(prompts)
+        else:
+            params = list(sampling_params)
+        ids = [self.add_request(p, sp) for p, sp in zip(prompts, params)]
+        final: dict[str, RequestOutput] = {}
+        while self.has_unfinished_requests():
+            for out in self.step():
+                if out.finished:
+                    final[out.request_id] = out
+        return [final[i] for i in ids]
+
+    def stats(self) -> dict:
+        s = {
+            "steps": self.num_steps,
+            "free_kv_blocks": self.allocator.num_free,
+            "total_kv_blocks": self.allocator.num_blocks,
+            "running": len(self.scheduler.running),
+            "waiting": len(self.scheduler.waiting),
+            "preemptions": self.scheduler.num_preemptions,
+        }
+        if self.radix is not None:
+            s["prefix_cache_hit_rate"] = round(self.radix.hit_rate, 4)
+            s["cached_blocks"] = self.radix.num_cached_blocks
+        s.update({f"moe_{k}": v for k, v in self.moe_executor.stats().items()})
+        return s

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tandem"
+version = "0.1.0"
+description = "Tandem: a single-GPU + CPU heterogeneous LLM inference engine (prototype)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.51",
+    "safetensors>=0.4",
+    "numpy>=1.26",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+tandem = "tandem.entrypoints.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/tandem"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
