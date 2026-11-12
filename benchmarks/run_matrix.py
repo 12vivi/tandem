@@ -48,24 +48,31 @@ VERSION_MODULE = {"vllm": "vllm", "sglang": "sglang", "tandem": "tandem"}
 
 
 def launch_cmd(a: argparse.Namespace) -> list[str]:
+    """Server command line. Prefix caching is off (matrix and A scenarios, design doc §6.4
+    rule 4) unless a.prefix_cache is set (B scenarios), in which case the engines also report
+    cached prompt tokens in the usage of every response."""
     common_vllm_sglang = ["--host", "127.0.0.1", "--port", str(a.port)]
+    prefix = getattr(a, "prefix_cache", False)
     if a.engine == "vllm":
+        cache = ["--enable-prefix-caching", "--enable-prompt-tokens-details"] if prefix else ["--no-enable-prefix-caching"]
         cmd = [a.python, "-m", "vllm.entrypoints.openai.api_server", "--model", a.model,
                "--served-model-name", a.served_name, "--dtype", a.dtype,
                "--max-model-len", str(a.max_model_len), "--gpu-memory-utilization", str(a.mem),
-               "--max-num-seqs", str(a.max_num_seqs), "--no-enable-prefix-caching", "--seed", "0",
+               "--max-num-seqs", str(a.max_num_seqs), *cache, "--seed", "0",
                *common_vllm_sglang]
     elif a.engine == "sglang":
+        cache = ["--enable-cache-report"] if prefix else ["--disable-radix-cache"]
         cmd = [a.python, "-m", "sglang.launch_server", "--model-path", a.model,
                "--served-model-name", a.served_name, "--dtype", a.dtype,
                "--context-length", str(a.max_model_len), "--mem-fraction-static", str(a.mem),
-               "--max-running-requests", str(a.max_num_seqs), "--disable-radix-cache", "--random-seed", "0",
+               "--max-running-requests", str(a.max_num_seqs), *cache, "--random-seed", "0",
                *common_vllm_sglang]
     else:  # tandem
         cmd = [a.python, "-m", "tandem.entrypoints.cli", "serve", "--model", a.model,
                "--served-model-name", a.served_name, "--device", "cuda", "--dtype", a.dtype,
                "--max-model-len", str(a.max_model_len), "--max-num-seqs", str(a.max_num_seqs),
-               "--kv-cache-gb", str(a.kv_cache_gb), "--no-prefix-caching", "--port", str(a.port)]
+               "--kv-cache-gb", str(a.kv_cache_gb), *([] if prefix else ["--no-prefix-caching"]),
+               "--port", str(a.port)]
     return cmd + shlex.split(a.extra_args)
 
 
@@ -175,12 +182,14 @@ def main() -> None:
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for the server process (repeatable)")
     ap.add_argument("--kv-budget", type=int, default=None, help="tokens; default = this engine's reported capacity")
     ap.add_argument("--sharegpt", default="", help="ShareGPT JSONL subset; enables the ShareGPT and offline cells")
-    ap.add_argument("--shapes", default="", help='override, e.g. "1024x256,256x1024"')
+    ap.add_argument("--shapes", default="", help='override, e.g. "1024x256,256x1024"; "none": no fixed-length cells')
+    ap.add_argument("--no-offline", action="store_true", help="skip the offline ShareGPT cell")
     ap.add_argument("--levels", default="", help='override, e.g. "1,4,16"')
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--quick", action="store_true", help="smoke test: 1024/256 at concurrency 1 and 4, one run")
     ap.add_argument("--startup-timeout", type=float, default=1200)
     ap.add_argument("--tag", default="", help="default: <engine>-<version>")
+    ap.add_argument("--scenario", default="v1", help='label stored as "matrix" in every result (v1, A1, A2 ...)')
     ap.add_argument("--save", default="", help="append result lines here")
     ap.add_argument("--log-dir", default=os.path.join(HERE, "results", "logs"))
     ap.add_argument("--dry-run", action="store_true")
@@ -190,7 +199,10 @@ def main() -> None:
     a.model = os.path.expanduser(a.model)
     if a.mem is None:
         a.mem = 0.85 if a.engine == "sglang" else 0.90
-    shapes = [tuple(int(x) for x in s.split("x")) for s in a.shapes.split(",")] if a.shapes else SHAPES
+    if a.shapes == "none":
+        shapes = []
+    else:
+        shapes = [tuple(int(x) for x in s.split("x")) for s in a.shapes.split(",")] if a.shapes else SHAPES
     levels = [int(x) for x in a.levels.split(",")] if a.levels else LEVELS
     if a.quick:
         shapes, levels, a.repeat, a.sharegpt = [(1024, 256)], [1, 4], 1, ""
@@ -221,7 +233,7 @@ def main() -> None:
         if not budget:
             raise SystemExit("could not read the KV capacity from the server log; pass --kv-budget")
         meta = {**env_meta, "kv_capacity_tokens": kv_cap, "kv_budget_tokens": budget, "max_num_seqs": a.max_num_seqs,
-                "mem_fraction": a.mem, "max_model_len": a.max_model_len, "dtype": a.dtype, "matrix": "v1",
+                "mem_fraction": a.mem, "max_model_len": a.max_model_len, "dtype": a.dtype, "matrix": a.scenario,
                 "extra_args": a.extra_args, "server_env": a.env}
         print(f"KV capacity {kv_cap} tokens, budget {budget}", flush=True)
         fits = lambda c, tokens: c * tokens <= budget and c <= a.max_num_seqs  # noqa: E731
@@ -234,7 +246,8 @@ def main() -> None:
             ok = [str(c) for c in levels if fits(c, SHAREGPT_MAX_TOKENS)]
             if ok:
                 bench(a, meta, ok, sg)
-            bench(a, meta, ["inf"], sg + ["--num-prompts", str(OFFLINE_REQUESTS)])
+            if not a.no_offline:
+                bench(a, meta, ["inf"], sg + ["--num-prompts", str(OFFLINE_REQUESTS)])
     finally:
         if proc is not None:
             stop(proc)

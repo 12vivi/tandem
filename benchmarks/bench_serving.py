@@ -49,6 +49,7 @@ class Result:
     prompt_tokens: int = 0
     output_tokens: int = 0
     error: str = ""
+    start: float = 0.0  # perf_counter() when the request was sent
 
 
 def load_tokenizer(path: str):
@@ -119,6 +120,7 @@ async def one_request(client: httpx.AsyncClient, url: str, model: str, req: Req,
     }
     res = Result()
     t0 = time.perf_counter()
+    res.start = t0
     last = t0
     chunks = 0
     try:
@@ -218,6 +220,17 @@ async def run_level(args, reqs: list[Req], concurrency: int, run_idx: int, meta:
     }
     if results and not ok:
         summary["first_error"] = results[0].error
+    dump_dir = os.environ.get("BENCH_DUMP_DIR")
+    if dump_dir:  # per-request records for diagnosis (send time relative to the start of the run)
+        os.makedirs(dump_dir, exist_ok=True)
+        name = f"{args.tag}-{args.dataset}-{summary['input_len']}-{summary['output_len']}-c{concurrency}-run{run_idx}.jsonl"
+        with open(os.path.join(dump_dir, name), "w", encoding="utf-8") as f:
+            for r, q in zip(results, reqs):
+                rec = {"start": round(r.start - t0, 4), "prompt_len": r.prompt_tokens or q.prompt_len,
+                       "output_tokens": r.output_tokens, "ttft": round(r.ttft, 4), "latency": round(r.latency, 4),
+                       "itl": [round(x, 4) for x in r.itl], "ok": r.ok,
+                       "start_ms": round(r.start * 1e3, 3)}  # perf_counter, the clock of TANDEM_TRACE
+                print(json.dumps(rec), file=f)
     return summary
 
 

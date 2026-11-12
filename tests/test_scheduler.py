@@ -8,9 +8,9 @@ from tandem.sampling_params import SamplingParams
 from tandem.scheduler.scheduler import Scheduler
 
 
-def _sched(num_blocks=64, budget=8, max_seqs=8):
+def _sched(num_blocks=64, budget=8, max_seqs=8, policy="prefill_first"):
     return Scheduler(BlockAllocator(num_blocks), block_size=4, max_num_seqs=max_seqs,
-                     max_num_batched_tokens=budget, max_model_len=1024)
+                     max_num_batched_tokens=budget, max_model_len=1024, policy=policy)
 
 
 def _req(rid, n_prompt, max_tokens=4):
@@ -37,8 +37,8 @@ def test_chunked_prefill_respects_budget():
     assert r.num_output_tokens == 1 and r.is_decoding
 
 
-def test_decode_scheduled_before_new_prefill():
-    s = _sched(budget=8)
+def test_decode_first_mixes_decodes_and_new_prefill():
+    s = _sched(budget=8, policy="decode_first")
     a = _req("a", 4, max_tokens=10)
     s.add_request(a)
     _step(s)  # a: prefill done, now decoding
@@ -46,6 +46,17 @@ def test_decode_scheduled_before_new_prefill():
     out = _step(s)
     assert [x.request.request_id for x in out.scheduled] == ["a", "b"]
     assert out.scheduled[0].num_tokens == 1 and out.scheduled[1].num_tokens == 7
+
+
+def test_prefill_first_prefills_new_request_alone():
+    s = _sched(budget=8)  # default policy
+    a = _req("a", 4, max_tokens=10)
+    s.add_request(a)
+    _step(s)  # a: prefill done, now decoding
+    s.add_request(_req("b", 12))
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("b", 8)]  # no decode for a
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("b", 4)]  # b still prefilling
+    assert sorted(x.request.request_id for x in _step(s).scheduled) == ["a", "b"]  # both decode
 
 
 def test_preemption_and_completion_free_all_blocks():

@@ -121,8 +121,13 @@ class FlashInferAttentionBackend:
         )
 
     def plan_decode(self, wrapper: Any, layout: PagedLayout) -> None:
+        # A CUDA-graph decode wrapper copies host kv_indices into its buffer with a blocking copy
+        # (FlashInfer 0.6: non_blocking only for device tensors), i.e. a stream sync per step that
+        # makes the host wait for the running step and so defeats overlap scheduling. Hand it a
+        # device tensor instead: an async H2D copy here, then a device-to-device copy in plan().
+        indices = layout.kv_indices.to(self.device, non_blocking=True)
         self._guarded_plan(wrapper, lambda: wrapper.plan(
-            layout.kv_indptr, layout.kv_indices, layout.kv_last_page_len,
+            layout.kv_indptr, indices, layout.kv_last_page_len,
             self.num_qo_heads, self.num_kv_heads, self.head_dim, self.block_size,
             q_data_type=self.dtype, kv_data_type=self.dtype, sm_scale=self.scale,
         ))

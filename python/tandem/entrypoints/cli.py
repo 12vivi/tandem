@@ -15,7 +15,7 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dtype", default="auto")
     p.add_argument("--max-num-seqs", type=int, default=64)
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
-    p.add_argument("--schedule-policy", choices=["decode_first", "prefill_first"], default="decode_first")
+    p.add_argument("--schedule-policy", choices=["prefill_first", "decode_first"], default="prefill_first")
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--kv-cache-gb", type=float, default=1.0)

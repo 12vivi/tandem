@@ -157,6 +157,38 @@ def test_prefix_sharing_and_preemption(tiny_path, tiny_fp32):
         assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
 
 
+@pytest.mark.parametrize("graph", [True, False], ids=["graph", "eager"])
+def test_steps_do_not_wait_for_queued_gpu_work(tiny_path, graph):
+    """With overlap scheduling the host prepares step N+1 while the GPU runs step N and waits
+    only for step N-1's sampled tokens. Any other host-device sync in a step (a blocking copy,
+    .item(), ...) leaves the GPU idle once per step: FlashInfer's plan() made one for host
+    kv_indices on a CUDA-graph wrapper (0.6B decode: 11.9% GPU idle, 2575 instead of 2323 us
+    per step). Queue a long GPU sleep, run a step: the sleep must still run when it returns."""
+    eng = make(tiny_path, cuda_graph=graph)
+    params = SamplingParams(max_tokens=64, temperature=0.0, ignore_eos=True)
+    stream = torch.cuda.current_stream()
+
+    def step_returns_while_gpu_busy() -> bool:
+        torch.cuda.synchronize()
+        torch.cuda._sleep(200_000_000)  # ~0.1 s of GPU work queued ahead of the step
+        eng.step()
+        busy = not stream.query()
+        torch.cuda.synchronize()
+        return busy
+
+    for p in prompts(5, [20, 33, 7], vocab=VOCAB):
+        eng.add_request(prompt_token_ids=p, sampling_params=params)
+    for _ in range(6):  # a prefill and decode steps; lazy initialisation may synchronise once
+        eng.step()
+    assert all(step_returns_while_gpu_busy() for _ in range(3)), "a decode step waited for the GPU"
+    first, second = prompts(6, [40, 40], vocab=VOCAB)
+    eng.add_request(prompt_token_ids=first, sampling_params=params)
+    for _ in range(3):  # warm up the 40-token prefill shape (new GEMM / attention kernels)
+        eng.step()
+    eng.add_request(prompt_token_ids=second, sampling_params=params)
+    assert step_returns_while_gpu_busy(), "a prefill step waited for the GPU"  # prefill_first: alone
+
+
 @pytest.mark.parametrize("has_norm", [True, False], ids=["qk_norm", "no_norm"])
 @torch.inference_mode()
 def test_fused_prologue_matches_float32_math(has_norm):

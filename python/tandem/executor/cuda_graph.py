@@ -20,6 +20,7 @@ import torch
 from torch import nn
 
 from tandem.executor.forward_context import ForwardContext
+from tandem.executor.step_timer import TIMER
 from tandem.layers.flashinfer_attention import FlashInferAttentionBackend, FlashInferMetadata, paged_layout
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ class CudaGraphRunner:
         b = len(seqs)
         bs = next(s for s in self.sizes if s >= b)
         layout = paged_layout(list(seqs) + self._dummy(bs - b), self.block_size)
+        TIMER.mark("graph_layout")
         ids = torch.zeros(bs, dtype=torch.long)
         ids[:b] = torch.tensor(input_ids, dtype=torch.long)
         self.input_ids[:bs].copy_(ids, non_blocking=True)
@@ -121,6 +123,9 @@ class CudaGraphRunner:
             self.input_ids[fixups[0]] = fixups[1]
         self.positions[:bs].copy_(layout.positions, non_blocking=True)
         self.slot_mapping[:bs].copy_(layout.slot_mapping, non_blocking=True)
+        TIMER.mark("graph_copies")
         self.backend.plan_decode(self.wrappers[bs], layout)
+        TIMER.mark("graph_plan")
         self.graphs[bs].replay()
+        TIMER.mark("graph_replay")
         return self.outputs[bs][:b]

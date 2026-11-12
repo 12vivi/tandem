@@ -40,6 +40,7 @@ def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s [core]: %(message)s")
     try:
         from tandem.engine.llm_engine import LLMEngine
+        from tandem.executor.step_timer import TRACE
 
         engine = LLMEngine(config, load_tokenizer=False)
         outbox.send(("ready",))
@@ -50,6 +51,8 @@ def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
                     msg = inbox.recv()
                     if msg[0] == "add":
                         _, rid, prompt_ids, params = msg
+                        if TRACE:
+                            TRACE("add", rid=rid, n=len(prompt_ids), max_tokens=params.max_tokens)
                         try:
                             engine.add_request(prompt_token_ids=prompt_ids, sampling_params=params, request_id=rid)
                         except Exception as exc:  # tell the caller instead of dying
@@ -64,6 +67,8 @@ def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
             if outs:
                 outbox.send(("outputs", [(o.request_id, o.delta_token_ids, o.finished, o.finish_reason,
                                           o.num_output_tokens, o.metrics) for o in outs]))
+                if TRACE:
+                    TRACE("sent", rids=[o.request_id for o in outs if o.num_output_tokens == 1])
     except BaseException:  # pragma: no cover - reported through /health
         outbox.send(("dead", traceback.format_exc()))
         raise

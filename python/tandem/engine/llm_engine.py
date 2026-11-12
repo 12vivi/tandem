@@ -14,6 +14,7 @@ from tandem.cache.radix_cache import RadixCache
 from tandem.config import EngineConfig
 from tandem.engine.detokenizer import detokenize_step
 from tandem.engine.request import Request, RequestOutput, RequestStatus
+from tandem.executor.step_timer import TIMER, TRACE
 from tandem.executor.model_runner import ModelRunner
 from tandem.layers.attention import TorchAttentionBackend
 from tandem.layers.moe import LocalMoEExecutor
@@ -247,16 +248,31 @@ class LLMEngine:
     def _step_overlap(self) -> list[RequestOutput]:
         """Launch step N, then finish step N-1 on the host while the GPU runs step N: its
         tokens become N's inputs on the device, so the host never waits before launching."""
+        TIMER.start()
         sched = self.scheduler.schedule()
+        TIMER.mark("schedule")
+        if TRACE and not sched.is_empty:
+            pre = [(s.request.request_id, s.num_tokens) for s in sched.scheduled if s.num_tokens > 1]
+            TRACE("launch", prefill=pre, decodes=len(sched.scheduled) - len(pre),
+                  waiting=len(self.scheduler.waiting))
         launched = None
         if not sched.is_empty:
             launched = self.runner.launch(sched)
             self.scheduler.on_launch(sched)
             self.num_steps += 1
+            TIMER.mark("book")
         prev, self.inflight = self.inflight, launched
         if prev is None:
+            TIMER.end_step()
             return []
-        return self._emit(self.scheduler.update_resolved(prev.sched, prev.resolve()))
+        sampled = prev.resolve()
+        TIMER.mark("wait_gpu")
+        updated = self.scheduler.update_resolved(prev.sched, sampled)
+        TIMER.mark("update")
+        outputs = self._emit(updated)
+        TIMER.mark("emit")
+        TIMER.end_step()
+        return outputs
 
     def _emit(self, updated: list[Request]) -> list[RequestOutput]:
         outputs = []

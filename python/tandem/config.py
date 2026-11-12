@@ -42,7 +42,9 @@ class EngineConfig:
     dtype: str = "auto"  # "auto" | "float32" | "bfloat16" | "float16" | "float64"
     max_num_seqs: int = 64
     max_num_batched_tokens: int = 2048  # per-step token budget (Sarathi-Serve chunked prefill)
-    schedule_policy: str = "decode_first"  # "decode_first" (Sarathi-Serve) | "prefill_first" (SGLang)
+    # "prefill_first" (as SGLang): a step that prefills carries no decodes; with it the parity matrix
+    # passes on the RTX 3090. "decode_first" (Sarathi-Serve) mixes prefill chunks into decode steps.
+    schedule_policy: str = "prefill_first"
     max_model_len: Optional[int] = None
     block_size: int = 16
     num_kv_blocks: Optional[int] = None

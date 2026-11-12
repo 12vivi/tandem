@@ -9,6 +9,7 @@ from torch import nn
 from tandem.cache.kv_cache import KVCache
 from tandem.engine.request import PLACEHOLDER, Request
 from tandem.executor.forward_context import ForwardContext
+from tandem.executor.step_timer import TIMER
 from tandem.layers.ops import TorchOps
 from tandem.layers.sampler import sample_token, sample_tokens, verify_draft
 from tandem.scheduler.scheduler import SchedulerOutput
@@ -95,10 +96,12 @@ class ModelRunner:
                 logit_rows.extend(range(offset + n - rows, offset + n))
                 owners.append((req, rows))
             offset += n
+        TIMER.mark("inputs")
         fixups = None
         if fix_pos:
             fixups = (torch.tensor(fix_pos, dtype=torch.long).to(self.device, non_blocking=True),
                       self.prev_tokens[torch.tensor(fix_rows, dtype=torch.long).to(self.device, non_blocking=True)])
+            TIMER.mark("fixups")
 
         decode_only = offset == len(seqs)  # one new token per request
         if self.graph_runner is not None and decode_only and self.graph_runner.can_run(len(seqs)):
@@ -111,6 +114,7 @@ class ModelRunner:
             if fixups is not None:
                 ids[fixups[0]] = fixups[1]
             hidden = self.model(ids, positions, ctx)
+            TIMER.mark("eager_forward")
         if not logit_rows:
             return InFlightStep(sched, results={})
         if len(logit_rows) != offset:
@@ -121,6 +125,7 @@ class ModelRunner:
         if any(r.spec_token_ids for r in reqs):  # speculative verification: synchronous
             return InFlightStep(sched, results=self._verify(logits, owners))
         tokens = sample_tokens(logits, [r.sampling_params for r in reqs], [r.generator for r in reqs])
+        TIMER.mark("logits_sample")
         for i, r in enumerate(reqs):
             r.inflight_row = i
         self.prev_tokens = tokens

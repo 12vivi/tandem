@@ -56,7 +56,7 @@ class Scheduler:
         max_num_batched_tokens: int,
         max_model_len: int,
         radix_cache: Optional[RadixCache] = None,
-        policy: str = "decode_first",
+        policy: str = "prefill_first",
     ) -> None:
         if policy not in ("decode_first", "prefill_first"):
             raise ValueError(f"unknown scheduling policy {policy!r}")
