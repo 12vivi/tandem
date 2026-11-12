@@ -145,7 +145,7 @@ def build_app(async_engine: AsyncEngine, tokenizer: Any, model_name: str, defaul
             text, n_out, reason = "", 0, None
             try:
                 async for out in async_engine.generate(prompt_ids, params, rid):
-                    text, n_out, reason = out.text, len(out.output_token_ids), out.finish_reason
+                    text, n_out, reason = out.text, out.num_output_tokens, out.finish_reason
             except ValueError as exc:
                 return _error(400, str(exc))
             choice = (
@@ -164,7 +164,7 @@ def build_app(async_engine: AsyncEngine, tokenizer: Any, model_name: str, defaul
                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
             try:
                 async for out in async_engine.generate(prompt_ids, params, rid):
-                    n_out = len(out.output_token_ids)
+                    n_out = out.num_output_tokens
                     if not out.delta_text and not out.finished:
                         continue
                     if chat:

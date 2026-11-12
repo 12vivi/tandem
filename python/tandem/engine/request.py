@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Optional
 
 from tandem.sampling_params import SamplingParams
 
+PLACEHOLDER = -1  # output token sampled on the GPU, value not yet copied to the host (overlap)
+
 if TYPE_CHECKING:
     import torch
 
@@ -69,9 +71,17 @@ class Request:
         # sampling RNG (only when the request carries a seed)
         self.generator: Optional["torch.Generator"] = None
 
-        # detokenization state
+        # overlap scheduling: output tokens sampled on the GPU but not yet seen by the host are
+        # PLACEHOLDER entries in output_token_ids; the oldest one is at index num_resolved_outputs.
+        # inflight_row: row of this request in the latest launched step's sampled-token tensor.
+        self.num_resolved_outputs = 0
+        self.inflight_row: Optional[int] = None
+
+        # detokenization state (incremental: only a short window of tokens is decoded per step)
         self.output_text = ""
         self.sent_text_len = 0
+        self.detok_prefix_offset = 0  # window start: tokens before it are final text
+        self.detok_read_offset = 0  # tokens up to here are already in output_text
         self.new_token_ids: list[int] = []  # tokens appended in the latest step
 
         # metrics
@@ -103,6 +113,11 @@ class Request:
 
     def token_ids_in_range(self, start: int, end: int) -> list[int]:
         """Token ids for positions [start, end), including draft tokens past ``num_tokens``."""
+        p = len(self.prompt_token_ids)
+        if start >= p and not self.spec_token_ids:  # decode: no copy of the whole sequence
+            return self.output_token_ids[start - p : end - p]
+        if end <= p:  # prompt chunk
+            return self.prompt_token_ids[start:end]
         tokens = self.all_token_ids + self.spec_token_ids
         return tokens[start:end]
 
@@ -136,3 +151,4 @@ class RequestOutput:
     finished: bool
     finish_reason: Optional[str]
     metrics: dict = field(default_factory=dict)
+    num_output_tokens: int = 0  # output_token_ids is filled only in the final output

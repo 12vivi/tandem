@@ -20,6 +20,34 @@ PROMPTS = [
 ]
 
 
+def test_incremental_detokenization_matches_full_decode():
+    """Token by token, the streamed text equals one full decode (multi-byte characters that
+    span several tokens are held back until complete)."""
+    import types
+
+    from transformers import AutoTokenizer
+
+    from tandem.engine.llm_engine import LLMEngine
+    from tandem.engine.request import Request, RequestStatus
+    from tandem.sampling_params import SamplingParams
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    text = "Hello, 世界! naïve café — emoji 😀🚀 和 ① 混合 text\n\tend"
+    ids = tok.encode(text)
+    fake = types.SimpleNamespace(tokenizer=tok)
+    req = Request("r", [1], SamplingParams(max_tokens=len(ids)))
+    streamed = ""
+    for i, t in enumerate(ids):
+        req.output_token_ids.append(t)
+        req.num_resolved_outputs = len(req.output_token_ids)  # as the scheduler does on arrival
+        if i == len(ids) - 1:
+            req.status = RequestStatus.FINISHED_LENGTH
+        delta = LLMEngine._detokenize(fake, req)
+        assert "�" not in delta
+        streamed += delta
+    assert streamed == req.output_text == tok.decode(ids)
+
+
 def test_greedy_matches_transformers():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

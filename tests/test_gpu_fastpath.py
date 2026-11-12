@@ -1,0 +1,221 @@
+"""GPU fast path (FlashInfer attention and ops, CUDA graphs) against the PyTorch reference path.
+
+Skipped unless CUDA and flashinfer are available. Both paths run BF16 on the GPU and differ
+only in kernel rounding, so the checks are: prefill logits close; greedy outputs agree on
+models with well-separated logits; CUDA-graph decode agrees with eager decode, including
+padded buckets, chunked prefill, prefix-cache sharing and preemption.
+
+    pytest tests/test_gpu_fastpath.py -q
+    TANDEM_TEST_MODEL=~/models/Qwen3-0.6B pytest tests/test_gpu_fastpath.py -q   # adds real weights
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+pytest.importorskip("flashinfer")
+
+from conftest import prompts  # noqa: E402
+from tandem.sampling_params import SamplingParams  # noqa: E402
+from tandem.utils import cdiv  # noqa: E402
+
+VOCAB = 512
+GREEDY = SamplingParams(max_tokens=24, temperature=0.0, ignore_eos=True)
+
+
+def _save_tiny_qwen3(path: str, num_heads: int, num_kv_heads: int) -> None:
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    cfg = Qwen3Config(vocab_size=VOCAB, hidden_size=256, intermediate_size=512, num_hidden_layers=2,
+                      num_attention_heads=num_heads, num_key_value_heads=num_kv_heads, head_dim=128,
+                      max_position_embeddings=2048, rms_norm_eps=1e-6, tie_word_embeddings=True)
+    torch.manual_seed(1234)
+    model = Qwen3ForCausalLM(cfg)
+    with torch.no_grad():  # well-separated logits: no greedy near-ties
+        for name, p in model.named_parameters():
+            if name.endswith("norm.weight"):
+                p.copy_(1.0 + 0.1 * torch.randn_like(p))
+            else:
+                p.normal_(0.0, 0.1)
+    model.save_pretrained(path)
+
+
+@pytest.fixture(scope="module", params=[(4, 2), (8, 2)], ids=["gqa2", "gqa4"])
+def tiny_path(request, tmp_path_factory) -> str:
+    heads, kv_heads = request.param
+    path = str(tmp_path_factory.mktemp(f"qwen3_gqa{heads // kv_heads}"))
+    _save_tiny_qwen3(path, heads, kv_heads)
+    return path
+
+
+def make(path: str, **overrides):
+    from tandem.config import EngineConfig
+    from tandem.engine.llm_engine import LLMEngine
+
+    kw = dict(model=path, device="cuda", dtype="bfloat16", block_size=16, num_kv_blocks=512,
+              max_num_batched_tokens=256, max_model_len=1024, max_num_seqs=16, cuda_graph_max_bs=16)
+    kw.update(overrides)
+    return LLMEngine(EngineConfig(**kw), load_tokenizer=False)
+
+
+def common_prefix(a: list[int], b: list[int]) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def fp32_reference(path: str):
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).cuda().eval()
+
+
+@torch.no_grad()
+def assert_same_or_near_tie(hf, prompt: list[int], a: list[int], b: list[int], tol: float) -> None:
+    """Two BF16 greedy outputs for one prompt agree, or first differ at a near-tie of the FP32
+    model: both chosen tokens in its top 5 and their FP32 scores within ``tol``. Different
+    kernels round differently, so either may pick either side of a near-tie; after the first
+    difference the continuations legitimately part (vLLM's tests use the same logic)."""
+    d = common_prefix(a, b)
+    if d == min(len(a), len(b)):
+        return
+    logits = hf(torch.tensor([prompt + a[:d]], device="cuda")).logits[0, -1].float()
+    gap = abs(float(logits[a[d]] - logits[b[d]]))
+    top = logits.topk(5).indices.tolist()
+    assert gap < tol and a[d] in top and b[d] in top, (d, gap, a[d], b[d], top)
+
+
+@pytest.fixture(scope="module")
+def tiny_fp32(tiny_path):
+    return fp32_reference(tiny_path)
+
+
+def test_backend_selection(tiny_path):
+    eng = make(tiny_path)
+    assert eng.backend_name == "flashinfer" and eng.runner.graph_runner is not None
+    assert make(tiny_path, attention_backend="torch").backend_name == "torch"
+
+
+@torch.inference_mode()
+def test_prefill_logits_close(tiny_path, tiny_fp32):
+    """The fast path is as close to FP32 as the BF16 reference path is."""
+    from tandem.executor.forward_context import ForwardContext
+
+    prompt = prompts(0, [37], vocab=VOCAB)[0]
+    exact = tiny_fp32(torch.tensor([prompt], device="cuda")).logits[0].float()
+    err = {}
+    for name in ("torch", "flashinfer"):
+        eng = make(tiny_path, attention_backend=name, cuda_graph=False)
+        blocks = eng.allocator.allocate(cdiv(len(prompt), eng.config.block_size))
+        runner = eng.runner
+        positions, meta = runner.attn_backend.prepare([(blocks, 0, len(prompt))], eng.config.block_size, eng.device)
+        ctx = ForwardContext(meta, eng.kv_cache, runner.attn_backend, eng.moe_executor, ops=runner.ops)
+        hidden = eng.model(torch.tensor(prompt, device=eng.device), positions, ctx)
+        err[name] = float((eng.model.compute_logits(hidden).float() - exact).abs().max())
+    assert err["flashinfer"] <= 1.5 * err["torch"] + 0.02, err
+
+
+def test_greedy_matches_reference_with_graphs(tiny_path, tiny_fp32):
+    # 5 requests -> padded into the batch-8 bucket; a 300-token prompt is chunked (budget 256)
+    ps = prompts(1, [5, 17, 40, 300, 9], vocab=VOCAB)
+    ref = make(tiny_path, attention_backend="torch").generate(ps, GREEDY)
+    eager_eng = make(tiny_path, cuda_graph=False)
+    eager = eager_eng.generate(ps, GREEDY)
+    graph_eng = make(tiny_path)
+    graph = graph_eng.generate(ps, GREEDY)
+    sync = make(tiny_path, overlap_schedule=False).generate(ps, GREEDY)  # no overlap
+    assert graph_eng.runner.num_graph_steps > 0 and eager_eng.runner.num_graph_steps == 0
+    for p, r, e, g, s in zip(ps, ref, eager, graph, sync):
+        for a, b in ((r, e), (e, g), (s, g)):
+            assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
+def test_prefix_sharing_and_preemption(tiny_path, tiny_fp32):
+    base = prompts(2, [64], vocab=VOCAB)[0]
+    followers = [base + p for p in prompts(3, [7, 21, 33], vocab=VOCAB)]
+    plain = make(tiny_path, enable_prefix_caching=False).generate(followers, GREEDY)
+    eng = make(tiny_path)
+    eng.generate([base], GREEDY)
+    shared = eng.generate(followers, GREEDY)  # several decode rows list the same cached blocks
+    assert eng.radix.hit_rate > 0
+    for p, a, b in zip(followers, plain, shared):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+    # 14 blocks x 16 tokens cannot hold six requests of 40 + 24 tokens at once
+    ps = prompts(4, [40] * 6, vocab=VOCAB)
+    tight = make(tiny_path, num_kv_blocks=14)
+    outs = tight.generate(ps, GREEDY)
+    loose = make(tiny_path).generate(ps, GREEDY)
+    assert tight.scheduler.num_preemptions > 0
+    for p, a, b in zip(ps, outs, loose):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
+@pytest.mark.parametrize("has_norm", [True, False], ids=["qk_norm", "no_norm"])
+@torch.inference_mode()
+def test_fused_prologue_matches_float32_math(has_norm):
+    pytest.importorskip("triton")
+    from tandem.layers.ops import _rotate_half
+    from tandem.layers.rotary import RotaryEmbedding
+    from tandem.layers.triton_ops import qkv_prologue
+
+    torch.manual_seed(0)
+    t, nh, nkv, hd, eps = 37, 8, 2, 128, 1e-6
+    dev, bf16 = torch.device("cuda"), torch.bfloat16
+    qkv = torch.randn(t, (nh + 2 * nkv) * hd, device=dev, dtype=bf16)
+    pos = torch.randint(0, 2000, (t,), device=dev)
+    slots = torch.randperm(64 * 16, device=dev)[:t]
+    rope = RotaryEmbedding(hd, 4096, 1e6, None).to(dev)
+    qw = (1 + 0.1 * torch.randn(hd, device=dev)).to(bf16)
+    kw = (1 + 0.1 * torch.randn(hd, device=dev)).to(bf16)
+    kc = torch.zeros(64 * 16, nkv, hd, device=dev, dtype=bf16)
+    vc = torch.zeros_like(kc)
+    q = qkv_prologue(qkv, pos, slots, kc, vc, rope.cos_sin_cache, nh, nkv, hd,
+                     qw if has_norm else None, kw if has_norm else None, eps)
+
+    x = qkv.float().view(t, nh + 2 * nkv, hd)
+    qh, kh, vh = x[:, :nh], x[:, nh:nh + nkv], x[:, nh + nkv:]
+    if has_norm:
+        qh = qh * torch.rsqrt(qh.pow(2).mean(-1, keepdim=True) + eps) * qw.float()
+        kh = kh * torch.rsqrt(kh.pow(2).mean(-1, keepdim=True) + eps) * kw.float()
+    cos, sin = rope.cos_cached[pos].unsqueeze(1), rope.sin_cached[pos].unsqueeze(1)
+    rot = lambda h: h * cos + _rotate_half(h) * sin  # noqa: E731
+    torch.testing.assert_close(q.float(), rot(qh), atol=3e-2, rtol=1e-2)
+    torch.testing.assert_close(kc[slots].float(), rot(kh), atol=3e-2, rtol=1e-2)
+    torch.testing.assert_close(vc[slots].float(), vh, atol=0, rtol=0)
+
+
+def test_greedy_with_fused_prologue(tiny_path, tiny_fp32):
+    pytest.importorskip("triton")
+    ps = prompts(5, [5, 17, 40, 300, 9], vocab=VOCAB)
+    plain = make(tiny_path, fused_prologue=False).generate(ps, GREEDY)
+    fused_eng = make(tiny_path, fused_prologue=True)
+    fused = fused_eng.generate(ps, GREEDY)
+    assert fused_eng.runner.ops.fused_prologue and fused_eng.runner.num_graph_steps > 0
+    for p, a, b in zip(ps, plain, fused):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
+MODEL = os.environ.get("TANDEM_TEST_MODEL")
+
+
+@pytest.mark.skipif(not MODEL, reason="set TANDEM_TEST_MODEL to a local HF model directory")
+def test_real_model_fast_path_matches_reference():
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    texts = ["The capital of France is", "def fibonacci(n):", "请用一句话介绍你自己。"]
+    ids = [tok.encode(t) for t in texts]
+    sp = SamplingParams(max_tokens=32, temperature=0.0, ignore_eos=True)
+    kw = dict(num_kv_blocks=None, kv_cache_memory_gb=1.0, max_model_len=2048)
+    ref = make(MODEL, attention_backend="torch", **kw).generate(ids, sp)
+    fast = make(MODEL, **kw).generate(ids, sp)
+    hf = fp32_reference(MODEL)
+    for p, r, f in zip(ids, ref, fast):
+        assert_same_or_near_tie(hf, p, r.output_token_ids, f.output_token_ids, tol=1.0)

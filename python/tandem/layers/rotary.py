@@ -31,7 +31,12 @@ def _inv_freq(head_dim: int, theta: float, rope_scaling: Optional[dict]) -> torc
 
 
 class RotaryEmbedding(nn.Module):
-    """Precomputed cos/sin tables (float32), applied with the HF ``rotate_half`` convention."""
+    """Precomputed cos/sin tables (float32), applied with the HF ``rotate_half`` convention.
+
+    ``cos_cached`` / ``sin_cached`` ([max_position, head_dim]) serve the reference path;
+    ``cos_sin_cache`` ([max_position, head_dim] = [cos of the half dims | sin of the half dims])
+    is the layout FlashInfer's ``apply_rope_with_cos_sin_cache_inplace`` reads.
+    """
 
     def __init__(self, head_dim: int, max_position: int, theta: float, rope_scaling: Optional[dict]) -> None:
         super().__init__()
@@ -41,6 +46,7 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.register_buffer("cos_sin_cache", torch.cat([freqs.cos(), freqs.sin()], dim=-1), persistent=False)
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.cos_cached[positions], self.sin_cached[positions]

@@ -18,6 +18,22 @@ class GatedMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class MergedGatedMLP(nn.Module):
+    """Dense SwiGLU MLP with gate and up fused into one GEMM ([gate | up] rows), as vLLM and
+    SGLang run it: one launch instead of two, and the same GEMM shape (so the same cuBLAS
+    kernel) as theirs. The loader fills ``gate_up_proj`` from the checkpoint's separate
+    ``gate_proj`` / ``up_proj`` tensors."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+        self.intermediate_size = intermediate_size
+        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, ops) -> torch.Tensor:
+        return self.down_proj(ops.silu_and_mul(self.gate_up_proj(x)))
+
+
 def swiglu(x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tensor:
     """Functional SwiGLU on raw weight tensors (used for GPU-cached expert copies)."""
     return F.linear(F.silu(F.linear(x, w_gate)) * F.linear(x, w_up), w_down)

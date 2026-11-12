@@ -12,17 +12,19 @@ from tandem.cache.block_allocator import BlockAllocator
 from tandem.cache.kv_cache import KVCache
 from tandem.cache.radix_cache import RadixCache
 from tandem.config import EngineConfig
+from tandem.engine.detokenizer import detokenize_step
 from tandem.engine.request import Request, RequestOutput, RequestStatus
 from tandem.executor.model_runner import ModelRunner
 from tandem.layers.attention import TorchAttentionBackend
 from tandem.layers.moe import LocalMoEExecutor
+from tandem.layers.ops import make_ops
 from tandem.model_config import ModelConfig
 from tandem.models import build_model
 from tandem.models.loader import cast_parameters, load_weights
 from tandem.sampling_params import SamplingParams
 from tandem.scheduler.scheduler import Scheduler
 from tandem.spec.ngram import NgramProposer
-from tandem.utils import resolve_device, resolve_dtype
+from tandem.utils import cdiv, resolve_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -69,20 +71,49 @@ class LLMEngine:
         bs = config.block_size
         per_block = KVCache.bytes_per_block(mc.num_hidden_layers, bs, mc.num_key_value_heads, mc.head_dim, self.dtype)
         num_blocks = config.num_kv_blocks or max(1, int(config.kv_cache_memory_gb * 2**30 // per_block))
-        self.kv_cache = KVCache(mc.num_hidden_layers, num_blocks, bs, mc.num_key_value_heads, mc.head_dim, self.dtype, self.device)
+        # one extra block that the allocator never hands out: padding rows of CUDA-graph
+        # batches write their dummy KV there
+        self.scratch_block = num_blocks
+        self.kv_cache = KVCache(mc.num_hidden_layers, num_blocks + 1, bs, mc.num_key_value_heads, mc.head_dim,
+                                self.dtype, self.device)
         self.allocator = BlockAllocator(num_blocks)
         self.radix = RadixCache(bs, self.allocator) if config.enable_prefix_caching else None
         self.scheduler = Scheduler(
-            self.allocator, bs, config.max_num_seqs, config.max_num_batched_tokens, self.max_model_len, self.radix
+            self.allocator, bs, config.max_num_seqs, config.max_num_batched_tokens, self.max_model_len, self.radix,
+            policy=config.schedule_policy,
         )
 
         # -------------------------------------------------------------- executors
         self.moe_executor = self._build_moe_executor() if self.hybrid else LocalMoEExecutor()
-        self.runner = ModelRunner(self.model, self.kv_cache, bs, self.device, TorchAttentionBackend(), self.moe_executor)
+        self.backend_name = self._pick_backend()
+        if self.backend_name == "flashinfer":
+            from tandem.layers.flashinfer_attention import FlashInferAttentionBackend
+
+            attn_backend = FlashInferAttentionBackend(mc.num_attention_heads, mc.num_key_value_heads, mc.head_dim,
+                                                      bs, self.dtype, self.device)
+        else:
+            attn_backend = TorchAttentionBackend()
+        ops = make_ops(self.backend_name, fused_prologue=config.fused_prologue and self.backend_name == "flashinfer")
+        graph_runner = None
+        # MoE routing syncs with the host (expert ids) and hybrid runs experts on the CPU:
+        # CUDA graphs are for dense models
+        if self.backend_name == "flashinfer" and config.cuda_graph and not mc.is_moe:
+            from tandem.executor.cuda_graph import CudaGraphRunner
+
+            graph_runner = CudaGraphRunner(
+                self.model, self.kv_cache, attn_backend, ops, self.moe_executor,
+                max_bs=min(config.cuda_graph_max_bs, config.max_num_seqs), scratch_block=self.scratch_block,
+                max_pages_per_seq=cdiv(self.max_model_len, bs),
+            )
+        self.runner = ModelRunner(self.model, self.kv_cache, bs, self.device, attn_backend, self.moe_executor,
+                                  ops=ops, graph_runner=graph_runner)
         spec = config.speculative
         self.proposer = NgramProposer(spec.ngram_min, spec.ngram_max) if spec.enabled and spec.method == "ngram" else None
         if spec.enabled and self.proposer is None:
             raise NotImplementedError(f"speculative method {spec.method!r} is not implemented yet")
+        # drafts depend on the latest tokens, so speculative decoding keeps the synchronous loop
+        self.overlap = config.overlap_schedule and self.proposer is None
+        self.inflight = None  # launched step whose tokens are not processed yet (overlap)
 
         self.tokenizer = tokenizer
         if self.tokenizer is None and load_tokenizer:
@@ -93,11 +124,30 @@ class LLMEngine:
         self._ids = itertools.count()
         self.num_steps = 0
         logger.info(
-            "engine ready: %s on %s/%s, %d KV blocks x %d tokens, hybrid=%s",
-            mc.architecture, self.device, self.dtype, num_blocks, bs, self.hybrid,
+            "engine ready: %s on %s/%s, %d KV blocks x %d tokens, hybrid=%s, backend=%s, cuda_graph=%s",
+            mc.architecture, self.device, self.dtype, num_blocks, bs, self.hybrid, self.backend_name,
+            graph_runner is not None,
         )
 
     # ------------------------------------------------------------------ setup
+    def _pick_backend(self) -> str:
+        name = self.config.attention_backend
+        fast_ok = self.device.type == "cuda" and self.dtype in (torch.float16, torch.bfloat16) and not self.hybrid
+        if name == "auto":
+            if not fast_ok:
+                return "torch"
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError:
+                logger.warning("flashinfer is not installed: using the PyTorch reference attention")
+                return "torch"
+            return "flashinfer"
+        if name == "flashinfer" and not fast_ok:
+            raise ValueError("the flashinfer backend needs a CUDA device, float16 / bfloat16 and no hybrid MoE")
+        if name not in ("torch", "flashinfer"):
+            raise ValueError(f"unknown attention backend {name!r}")
+        return name
+
     def _place_for_hybrid(self, model: nn.Module) -> None:
         """Everything but routed experts goes to the device; experts stay on the CPU."""
         dev = self.device
@@ -177,24 +227,44 @@ class LLMEngine:
             self.scheduler.finish_request(req, RequestStatus.FINISHED_ABORTED)
 
     def has_unfinished_requests(self) -> bool:
-        return self.scheduler.has_unfinished()
+        return self.scheduler.has_unfinished() or self.inflight is not None
 
     # -------------------------------------------------------------------- step
     def step(self) -> list[RequestOutput]:
+        if self.overlap:
+            return self._step_overlap()
         sched = self.scheduler.schedule()
         if sched.is_empty:
             return []
         sampled = self.runner.execute(sched)
         updated = self.scheduler.update_from_output(sched, sampled)
         self.num_steps += 1
+        outputs = self._emit(updated)
+        if self.proposer is not None:
+            self._propose_drafts()
+        return outputs
+
+    def _step_overlap(self) -> list[RequestOutput]:
+        """Launch step N, then finish step N-1 on the host while the GPU runs step N: its
+        tokens become N's inputs on the device, so the host never waits before launching."""
+        sched = self.scheduler.schedule()
+        launched = None
+        if not sched.is_empty:
+            launched = self.runner.launch(sched)
+            self.scheduler.on_launch(sched)
+            self.num_steps += 1
+        prev, self.inflight = self.inflight, launched
+        if prev is None:
+            return []
+        return self._emit(self.scheduler.update_resolved(prev.sched, prev.resolve()))
+
+    def _emit(self, updated: list[Request]) -> list[RequestOutput]:
         outputs = []
         for req in updated:
             delta_text = self._detokenize(req)
             outputs.append(self._make_output(req, delta_text))
             if req.finished:
                 self.requests.pop(req.request_id, None)
-        if self.proposer is not None:
-            self._propose_drafts()
         return outputs
 
     def _propose_drafts(self) -> None:
@@ -206,21 +276,17 @@ class LLMEngine:
             req.spec_token_ids = self.proposer.propose(req.all_token_ids, cap) if cap > 0 else []
 
     def _detokenize(self, req: Request) -> str:
+        """Incremental: decode only the window [prefix_offset:] of the output tokens and append
+        what it adds beyond [prefix_offset:read_offset] (vLLM's ``detokenize_incrementally``).
+        Text ending in an incomplete UTF-8 sequence is held back until the request finishes."""
         if self.tokenizer is None:
             return ""
-        text = self.tokenizer.decode(req.output_token_ids, skip_special_tokens=req.sampling_params.skip_special_tokens)
-        if not req.finished and text.endswith("�"):  # incomplete UTF-8 sequence: hold back
-            text = text[: len(req.output_text)] if len(text) > len(req.output_text) else req.output_text
-        stops = req.sampling_params.stop
-        if stops:
-            cut = min((pos for pos in (text.find(s) for s in stops) if pos >= 0), default=-1)
-            if cut >= 0:
-                text = text[:cut]
-                if not req.finished:
-                    self.scheduler.finish_request(req, RequestStatus.FINISHED_STOPPED)
-        req.output_text = text
-        delta = text[req.sent_text_len :]
-        req.sent_text_len = len(text)
+        sp = req.sampling_params
+        # tokens past num_resolved_outputs are still in flight (overlap scheduling)
+        delta, stopped = detokenize_step(self.tokenizer, req, req.output_token_ids, req.num_resolved_outputs,
+                                         req.finished, sp.skip_special_tokens, sp.stop)
+        if stopped and not req.finished:
+            self.scheduler.finish_request(req, RequestStatus.FINISHED_STOPPED)
         return delta
 
     def _make_output(self, req: Request, delta_text: str) -> RequestOutput:
@@ -232,16 +298,19 @@ class LLMEngine:
             metrics["cached_tokens"] = req.num_cached_tokens
             if req.num_draft_tokens:
                 metrics["spec_acceptance"] = req.num_accepted_tokens / req.num_draft_tokens
+        n = req.num_resolved_outputs
         return RequestOutput(
             request_id=req.request_id,
             prompt_token_ids=req.prompt_token_ids,
-            output_token_ids=list(req.output_token_ids),
+            # the full list only once finished: copying it for every streamed delta is O(length)
+            output_token_ids=req.output_token_ids[:n] if req.finished else [],
             text=req.output_text,
             delta_text=delta_text,
             delta_token_ids=list(req.new_token_ids),
             finished=req.finished,
             finish_reason=req.finish_reason,
             metrics=metrics,
+            num_output_tokens=n,
         )
 
     # --------------------------------------------------------------- offline API

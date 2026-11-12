@@ -42,6 +42,7 @@ class EngineConfig:
     dtype: str = "auto"  # "auto" | "float32" | "bfloat16" | "float16" | "float64"
     max_num_seqs: int = 64
     max_num_batched_tokens: int = 2048  # per-step token budget (Sarathi-Serve chunked prefill)
+    schedule_policy: str = "decode_first"  # "decode_first" (Sarathi-Serve) | "prefill_first" (SGLang)
     max_model_len: Optional[int] = None
     block_size: int = 16
     num_kv_blocks: Optional[int] = None
@@ -49,5 +50,15 @@ class EngineConfig:
     enable_prefix_caching: bool = True
     seed: int = 0
     cpu_threads: int = 0  # torch intra-op threads; 0 keeps the torch default
+    # "auto": FlashInfer kernels (attention, norms, SiLU-and-mul, RoPE) on CUDA with
+    # float16 / bfloat16 when flashinfer is installed, the PyTorch reference path otherwise
+    attention_backend: str = "auto"  # "auto" | "torch" | "flashinfer"
+    cuda_graph: bool = True  # decode steps replay CUDA graphs (FlashInfer backend, dense models)
+    cuda_graph_max_bs: int = 64  # largest captured decode batch (capped at max_num_seqs)
+    # launch step N before step N-1's tokens reach the host (not with speculative decoding)
+    overlap_schedule: bool = True
+    # FlashInfer path: QK-norm + RoPE + KV write as one Triton kernel (tandem.layers.triton_ops);
+    # falls back to the unfused kernels when Triton is missing
+    fused_prologue: bool = True
     speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
     hybrid: HybridConfig = field(default_factory=HybridConfig)

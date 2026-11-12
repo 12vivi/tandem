@@ -15,11 +15,19 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dtype", default="auto")
     p.add_argument("--max-num-seqs", type=int, default=64)
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    p.add_argument("--schedule-policy", choices=["decode_first", "prefill_first"], default="decode_first")
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--kv-cache-gb", type=float, default=1.0)
     p.add_argument("--no-prefix-caching", action="store_true")
     p.add_argument("--cpu-threads", type=int, default=0)
+    p.add_argument("--attention-backend", choices=["auto", "torch", "flashinfer"], default="auto",
+                   help="auto: FlashInfer kernels on CUDA (bf16 / fp16) when installed, else the PyTorch reference")
+    p.add_argument("--no-cuda-graph", action="store_true", help="run decode steps eagerly")
+    p.add_argument("--cuda-graph-max-bs", type=int, default=64)
+    p.add_argument("--no-overlap", action="store_true", help="wait for each step's tokens before scheduling the next")
+    p.add_argument("--no-fused-prologue", action="store_true",
+                   help="unfused QK-norm / RoPE / KV write instead of one Triton kernel (FlashInfer backend)")
     p.add_argument("--spec", choices=["none", "ngram"], default="none", help="speculative decoding method")
     p.add_argument("--num-spec-tokens", type=int, default=4)
     p.add_argument("--hybrid", action="store_true", help="three-path MoE expert execution")
@@ -29,37 +37,57 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
 
 
 def _make_engine(args):
-    from tandem.config import EngineConfig, HybridConfig, SpeculativeConfig
     from tandem.engine.llm_engine import LLMEngine
 
-    cfg = EngineConfig(
+    return LLMEngine(_engine_config(args))
+
+
+def _engine_config(args):
+    from tandem.config import EngineConfig, HybridConfig, SpeculativeConfig
+
+    return EngineConfig(
         model=args.model,
         device=args.device,
         dtype=args.dtype,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        schedule_policy=args.schedule_policy,
         max_model_len=args.max_model_len,
         block_size=args.block_size,
         kv_cache_memory_gb=args.kv_cache_gb,
         enable_prefix_caching=not args.no_prefix_caching,
         cpu_threads=args.cpu_threads,
+        attention_backend=args.attention_backend,
+        cuda_graph=not args.no_cuda_graph,
+        cuda_graph_max_bs=args.cuda_graph_max_bs,
+        overlap_schedule=not args.no_overlap,
+        fused_prologue=not args.no_fused_prologue,
         speculative=SpeculativeConfig(method=args.spec, num_speculative_tokens=args.num_spec_tokens),
         hybrid=HybridConfig(enabled=args.hybrid, gpu_expert_slots=args.gpu_expert_slots,
                             vram_budget_gb=args.vram_budget_gb, hw_profile=args.hw_profile),
     )
-    return LLMEngine(cfg)
 
 
 def cmd_serve(args) -> None:
     import uvicorn
 
-    from tandem.engine.async_engine import AsyncEngine
     from tandem.entrypoints.openai_server import build_app
 
-    engine = _make_engine(args)
     name = args.served_model_name or args.model.rstrip("/\\").replace("\\", "/").split("/")[-1]
-    app = build_app(AsyncEngine(engine), engine.tokenizer, name, args.default_max_tokens)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    if args.no_engine_process:  # engine thread inside the API process
+        from tandem.engine.async_engine import AsyncEngine
+
+        engine = _make_engine(args)
+        async_engine, tokenizer = AsyncEngine(engine), engine.tokenizer
+    else:  # engine core in its own process (default)
+        from transformers import AutoTokenizer
+
+        from tandem.engine.mp_engine import MPAsyncEngine
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        async_engine = MPAsyncEngine(_engine_config(args), tokenizer)
+    app = build_app(async_engine, tokenizer, name, args.default_max_tokens)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 def cmd_generate(args) -> None:
@@ -112,6 +140,8 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--served-model-name", default=None)
     p.add_argument("--default-max-tokens", type=int, default=256)
+    p.add_argument("--no-engine-process", action="store_true",
+                   help="run the engine in a thread of the API process instead of its own process")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("generate", help="one-off generation")

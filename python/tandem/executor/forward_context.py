@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
+
+from tandem.layers.ops import TorchOps
 
 if TYPE_CHECKING:
     from tandem.cache.kv_cache import KVCache
@@ -11,7 +13,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class AttentionMetadata:
-    """Per-step attention inputs shared by all layers.
+    """Per-step inputs of the reference attention backend, shared by all layers.
 
     The reference backend pads the batch to ``[B, Qmax]`` queries x ``[B, Lmax]`` keys.
     """
@@ -26,10 +28,12 @@ class AttentionMetadata:
 
 @dataclass
 class ForwardContext:
-    attn: AttentionMetadata
+    attn: Any  # backend-specific metadata (AttentionMetadata for the reference backend)
     kv_cache: "KVCache"
     attn_backend: Any
     moe_executor: Any
+    positions: torch.Tensor = None  # [T] position of every token (RoPE)
+    ops: Any = field(default_factory=TorchOps)  # tandem.layers.ops.TorchOps / FlashInferOps
 
 
 def build_attention_metadata(

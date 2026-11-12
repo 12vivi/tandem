@@ -6,7 +6,7 @@ Design document: docs/设计方案.md
 from tandem.config import EngineConfig, HybridConfig, SpeculativeConfig
 from tandem.sampling_params import SamplingParams
 
-__version__ = "0.1.0"
+__version__ = "0.2.0.dev0"
 __all__ = ["EngineConfig", "HybridConfig", "SpeculativeConfig", "SamplingParams", "LLMEngine"]
 
 

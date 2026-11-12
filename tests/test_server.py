@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from conftest import make_engine
+from tandem.config import EngineConfig
 from tandem.engine.async_engine import AsyncEngine
+from tandem.engine.mp_engine import MPAsyncEngine
 from tandem.entrypoints.openai_server import build_app
 
 
@@ -23,18 +26,28 @@ class ByteTokenizer:
         return text + ("<assistant>" if add_generation_prompt else "")
 
 
-def _client(tiny_model):
+def _client(tiny_model, kind: str):
     tok = ByteTokenizer()
-    eng = make_engine(tiny_model("qwen3").path, tokenizer=tok)
-    return TestClient(build_app(AsyncEngine(eng), tok, "tiny-qwen3"))
+    path = tiny_model("qwen3").path
+    if kind == "thread":  # engine thread inside the API process
+        engine = AsyncEngine(make_engine(path, tokenizer=tok))
+    else:  # engine core in a spawned process; detokenization and stop strings in the API process
+        cfg = EngineConfig(model=path, device="cpu", dtype="float64", block_size=4, num_kv_blocks=256,
+                           max_num_batched_tokens=64, max_model_len=256)
+        engine = MPAsyncEngine(cfg, tok)
+    return TestClient(build_app(engine, tok, "tiny-qwen3"))
+
+
+KINDS = pytest.mark.parametrize("kind", ["thread", "process"])
 
 
 def _events(resp):
     return [line[len("data: "):] for line in resp.iter_lines() if line.startswith("data: ")]
 
 
-def test_completion_and_chat(tiny_model):
-    with _client(tiny_model) as client:
+@KINDS
+def test_completion_and_chat(tiny_model, kind):
+    with _client(tiny_model, kind) as client:
         assert client.get("/health").json() == {"status": "ok"}
         r = client.post("/v1/completions", json={"prompt": "hello", "max_tokens": 5, "temperature": 0, "ignore_eos": True})
         body = r.json()
@@ -50,8 +63,9 @@ def test_completion_and_chat(tiny_model):
         assert r.status_code == 400
 
 
-def test_streaming_with_usage(tiny_model):
-    with _client(tiny_model) as client:
+@KINDS
+def test_streaming_with_usage(tiny_model, kind):
+    with _client(tiny_model, kind) as client:
         payload = {"prompt": [1, 2, 3, 4], "max_tokens": 6, "temperature": 0, "ignore_eos": True,
                    "stream": True, "stream_options": {"include_usage": True}}
         with client.stream("POST", "/v1/completions", json=payload) as resp:
@@ -64,3 +78,16 @@ def test_streaming_with_usage(tiny_model):
         # non-stream output equals the concatenated stream (greedy, same prompt)
         full = client.post("/v1/completions", json={**payload, "stream": False}).json()["choices"][0]["text"]
         assert "".join(c["choices"][0]["text"] for c in chunks[:-1]) == full
+
+
+@KINDS
+def test_stop_string(tiny_model, kind):
+    with _client(tiny_model, kind) as client:
+        base = {"prompt": [5, 6, 7], "max_tokens": 16, "temperature": 0, "ignore_eos": True}
+        full = client.post("/v1/completions", json=base).json()["choices"][0]["text"]
+        stop = next((c for c in full[2:] if c.isascii() and c.isprintable()), None)
+        if stop is None:
+            pytest.skip("greedy output has no printable ASCII character to stop on")
+        body = client.post("/v1/completions", json={**base, "stop": [stop]}).json()
+        assert body["choices"][0]["text"] == full[: full.index(stop)]
+        assert body["choices"][0]["finish_reason"] == "stop"
