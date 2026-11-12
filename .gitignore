@@ -12,9 +12,13 @@ dist/
 *.safetensors
 *.gguf
 benchmarks/results/
+benchmarks/data/
 
 # IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# local staging for server transfers (wheels, model copies)
+/.transfer/

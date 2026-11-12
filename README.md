@@ -2,7 +2,7 @@
 
 面向特定模型的 LLM 推理框架原型：先在选定模型（Qwen3 稠密系列，以 Qwen3-8B 为准）上与 vLLM / SGLang 性能对齐，再在特定场景做专项优化，包括低 batch decode 的算子（A 场景）和显存 / 主机内存 / SSD 多级 KV 存储（B 场景）。设计方案、调研结论和每个组件的出处见 [docs/设计方案.md](docs/设计方案.md)。
 
-> 状态：v0.1 原型。引擎主干（调度、分页 KV、radix 缓存）和参考模型实现可以在 CPU / GPU 上端到端运行，数值已与 HF Transformers 对齐。GPU 快速路径（FlashInfer、CUDA Graph、融合算子）和与 vLLM / SGLang 的同机对比还没有做（见下方"路线图"）。
+> 状态：v0.1 原型。引擎主干（调度、分页 KV、radix 缓存）和参考模型实现可以在 CPU / GPU 上端到端运行，数值已与 HF Transformers 对齐。GPU 快速路径（FlashInfer、CUDA Graph、融合算子）还没有做（见下方"路线图"）。与 vLLM / SGLang 的同机对比已用过渡版本跑完 Qwen3-0.6B 和 Qwen3-8B 的对齐矩阵。v0.1 在 0.6B 上只有较强对手的 0.06–0.12，见 [docs/P0基线报告.md](docs/P0基线报告.md)。
 
 ## 已实现
 
@@ -49,7 +49,7 @@ Linux 上把 `.venv/Scripts/` 换成 `.venv/bin/`。
 
 ## 路线图（对应设计方案 §8）
 
-- **P0 基线**（进行中）：解决服务器环境，跑 vLLM / SGLang 在 Qwen3-8B 上的对齐矩阵和场景基线，逐算子剖析（`benchmarks/README.md`、`docs/P0基线报告.md`）。
+- **P0 基线**（进行中）：解决服务器环境，跑 vLLM / SGLang 在 Qwen3-8B 上的对齐矩阵和场景基线，逐算子剖析（`benchmarks/README.md`、`docs/P0基线报告.md`）。对齐矩阵已用过渡版本跑完（0.6B、8B），场景基线和逐算子剖析还没做。
 - **P1 对齐**：FlashInfer attention、CUDA Graph、融合小算子、批量采样、overlap 主循环、API 与引擎进程拆分；Qwen3-0.6B 和 Qwen3-8B BF16 达到 vLLM / SGLang 较好者的 0.95 倍以上。
 - **P2 算子**：W4A16 / W8A8 先对齐，再做模型专用融合、形状专用 GEMV、低 batch decode 持久化内核（研究线）。
 - **P3 多级存储**：L2 主机内存 / L3 NVMe KV 缓存、按层流水载入、载入 / 重算拆分、会话与 Agent 感知的保留和预取。P2 与 P3 可并行。
