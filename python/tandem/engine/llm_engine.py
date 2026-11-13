@@ -95,6 +95,12 @@ class LLMEngine:
         else:
             attn_backend = TorchAttentionBackend()
         ops = make_ops(self.backend_name, fused_prologue=config.fused_prologue and self.backend_name == "flashinfer")
+        self.num_gemv_layers = self.num_fused_layers = 0
+        if self.backend_name == "flashinfer" and config.small_batch_gemv and self.dtype in (torch.float16, torch.bfloat16):
+            from tandem.layers import triton_gemv
+
+            self.num_gemv_layers = triton_gemv.install(self.model, triton_gemv.table_for(self.device, self.model))
+            self.num_fused_layers = triton_gemv.install_fused(self.model, triton_gemv.fused_table_for(self.device, self.model))
         graph_runner = None
         # MoE routing syncs with the host (expert ids) and hybrid runs experts on the CPU:
         # CUDA graphs are for dense models

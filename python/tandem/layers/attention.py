@@ -76,10 +76,13 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
 
-    def forward(self, hidden: torch.Tensor, rope: nn.Module, ctx: ForwardContext) -> torch.Tensor:
-        t = hidden.shape[0]
+    def forward(
+        self, hidden: torch.Tensor, rope: nn.Module, ctx: ForwardContext, qkv: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``qkv``: the fused projection already computed (norm fused into it, triton_gemv)."""
+        qkv = self.qkv_proj(hidden) if qkv is None else qkv
+        t = qkv.shape[0]
         ops = ctx.ops
-        qkv = self.qkv_proj(hidden)
         if getattr(ops, "fused_prologue", False) and hasattr(ctx.attn_backend, "attend"):
             # one kernel: QK-norm + RoPE -> q, and k / v straight into the KV cache
             q = ops.qkv_prologue(

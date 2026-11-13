@@ -52,6 +52,9 @@ class DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ops = ctx.ops
         n1, n2 = self.input_layernorm, self.post_attention_layernorm
+        fused = getattr(self, "fused_gemv", None)  # set by tandem.layers.triton_gemv.install
+        if fused is not None and hidden.dim() == 2 and fused.applies(hidden.shape[0]):
+            return fused.forward(self, hidden, residual, rope, ctx)
         if residual is None:
             residual = hidden
             hidden = ops.rms_norm(hidden, n1.weight, n1.eps)
@@ -91,7 +94,13 @@ class LlamaFamilyForCausalLM(nn.Module):
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         weight = self.model.embed_tokens.weight if self.lm_head is None else self.lm_head.weight
-        logits = torch.nn.functional.linear(hidden, weight)
+        table = getattr(self, "gemv_table", None)  # set by tandem.layers.triton_gemv.install
+        if table:
+            from tandem.layers.triton_gemv import linear
+
+            logits = linear(hidden, weight, table)
+        else:
+            logits = torch.nn.functional.linear(hidden, weight)
         return logits if logits.dtype == torch.float64 else logits.float()
 
     def moe_blocks(self) -> dict[int, SparseMoeBlock]:

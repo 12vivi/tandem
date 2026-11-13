@@ -234,6 +234,66 @@ def test_greedy_with_fused_prologue(tiny_path, tiny_fp32):
         assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
 
 
+@pytest.mark.parametrize("defer", [False, True], ids=["reduce_each", "defer"])
+def test_small_batch_gemv_matches_linear(defer):
+    pytest.importorskip("triton")
+    from tandem.layers.triton_gemv import gemv
+
+    torch.manual_seed(7)
+    for n, k in ((1024, 2048), (4096, 1024), (6, 512)):  # odd N exercises the row mask
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+        for m in range(1, 9):
+            x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            ref = (x.float() @ w.float().t())
+            for bn, bk, nw in ((1, 512, 1), (2, 256, 2), (4, 512, 4)):
+                out = gemv(x, w, bn, bk, nw, 3, defer=defer).float()
+                assert torch.allclose(out, ref, atol=0.02, rtol=0.01), (n, k, m, bn, bk, nw)
+
+
+def test_gemv_prologue_matches_unfused():
+    pytest.importorskip("triton")
+    from tandem.layers.triton_gemv import gemv_prologue
+
+    torch.manual_seed(3)
+    n, k = 768, 512
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    g = torch.rand(k, device="cuda", dtype=torch.bfloat16) + 0.5
+    for m in (1, 2, 3, 4, 8):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        r = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        v = x.float() + r.float()
+        normed = (v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + 1e-6) * g.float()).to(torch.bfloat16).float()
+        y, r_new = gemv_prologue("add_rmsnorm", x, w, residual=r, norm_weight=g, eps=1e-6, block_n=2, block_k=256)
+        assert torch.allclose(y.float(), normed @ w.float().t(), atol=0.03, rtol=0.02)
+        assert torch.equal(r_new, v.to(torch.bfloat16))
+        y = gemv_prologue("rmsnorm", x, w, norm_weight=g, eps=1e-6, block_n=4, block_k=128, num_warps=2)
+        xn = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6) * g.float()).to(torch.bfloat16)
+        assert torch.allclose(y.float(), xn.float() @ w.float().t(), atol=0.03, rtol=0.02)
+        h = torch.randn(m, 2 * k, device="cuda", dtype=torch.bfloat16)
+        act = (torch.nn.functional.silu(h[:, :k].float()) * h[:, k:].float()).to(torch.bfloat16).float()
+        y = gemv_prologue("silu_mul", h, w, block_n=1, block_k=512)
+        assert torch.allclose(y.float(), act @ w.float().t(), atol=0.03, rtol=0.02)
+
+
+@pytest.mark.parametrize("force", ["1", "2"], ids=["gemv", "gemv_fused"])
+def test_greedy_with_small_batch_gemv(tiny_path, tiny_fp32, monkeypatch, force):
+    """Every decoder projection through the Triton GEMV (forced; "2" also folds the norms and
+    SiLU-and-mul into the GEMV input): same greedy outputs as cuBLAS, within near-ties, in
+    CUDA-graph decode (batch buckets 1-8) and eager prefill."""
+    pytest.importorskip("triton")
+    ps = prompts(6, [5, 17, 40, 300, 9], vocab=VOCAB)
+    plain_eng = make(tiny_path, small_batch_gemv=False)
+    plain = plain_eng.generate(ps, GREEDY)
+    monkeypatch.setenv("TANDEM_GEMV_FORCE", force)
+    gemv_eng = make(tiny_path)
+    out = gemv_eng.generate(ps, GREEDY)
+    assert plain_eng.num_gemv_layers == 0 and gemv_eng.num_gemv_layers == 4 * 2  # 4 projections x 2 layers
+    assert gemv_eng.num_fused_layers == (2 if force == "2" else 0)
+    assert gemv_eng.runner.num_graph_steps > 0
+    for p, a, b in zip(ps, plain, out):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
 MODEL = os.environ.get("TANDEM_TEST_MODEL")
 
 

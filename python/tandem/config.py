@@ -62,5 +62,8 @@ class EngineConfig:
     # FlashInfer path: QK-norm + RoPE + KV write as one Triton kernel (tandem.layers.triton_ops);
     # falls back to the unfused kernels when Triton is missing
     fused_prologue: bool = True
+    # FlashInfer path: decoder projections at batch <= 8 through the Triton small-batch GEMV where
+    # it beats cuBLAS on this GPU (tandem.layers.triton_gemv.CONFIGS)
+    small_batch_gemv: bool = True
     speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
     hybrid: HybridConfig = field(default_factory=HybridConfig)
