@@ -48,7 +48,8 @@ CLASSES = [  # (class, regex on the lower-cased kernel name); first match wins
     ("rope", r"rotary|rope|pos_encoding|cos_sin"),
     ("activation", r"silu|act_and_mul|swiglu|gelu"),
     ("attention", r"flash_fwd|fmha|attention|batchdecode|batchprefill|withpagedkv|withkvcache|merge_?states?|paged_attn"),
-    ("gemm", r"gemm|gemv|cutlass|cublas|xmma|s16816|splitk|marlin|matmul"),
+    ("dequant", r"dequant"),  # tandem's AWQ prefill path (dequantize, then cuBLAS)
+    ("gemm", r"gemm|gemv|cutlass|cublas|xmma|s16816|splitk|marlin|matmul|w4_mma"),
     ("sampling", r"argmax|sampl|softmax|topk|top_k|top_p|sort|gumbel|penalt"),
 ]
 

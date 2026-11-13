@@ -9,6 +9,11 @@ Each bucket has its own CUDA-graph-safe FlashInfer decode wrapper (fixed indptr 
 last-page-len buffers). Per step, outside the graph: copy token ids, positions and KV slots
 into the static buffers and re-plan the bucket's wrapper; then replay. Logits are computed
 outside the graph on the real rows only.
+
+Buckets from the attention backend's ``nosplit_min_batch`` up get a second graph with its own
+wrapper, planned without KV splitting (see FlashInferAttentionBackend); a step replays it when
+its longest context is at most ``nosplit_max_len`` tokens. Each wrapper is always planned the
+way it was captured.
 """
 
 from __future__ import annotations
@@ -63,41 +68,49 @@ class CudaGraphRunner:
         self.wrappers: dict[int, Any] = {}
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.outputs: dict[int, torch.Tensor] = {}
+        self.nosplit: dict[int, tuple[Any, torch.cuda.CUDAGraph, torch.Tensor]] = {}  # bucket -> (wrapper, graph, out)
         self._capture_all()
 
     # ------------------------------------------------------------------ capture
     def _dummy(self, n: int) -> list[tuple[list[int], int, int]]:
         return [([self.scratch_block], 0, 1)] * n
 
+    def _capture(self, bs: int, pool: Any, split: bool) -> tuple[Any, torch.cuda.CUDAGraph, torch.Tensor]:
+        device = self.backend.device
+        wrapper = self.backend.make_decode_wrapper(
+            paged_kv_indptr_buffer=torch.zeros(bs + 1, dtype=torch.int32, device=device),
+            paged_kv_indices_buffer=torch.zeros(bs * self.max_pages_per_seq, dtype=torch.int32, device=device),
+            paged_kv_last_page_len_buffer=torch.zeros(bs, dtype=torch.int32, device=device),
+        )
+        self.backend.plan_decode(wrapper, paged_layout(self._dummy(bs), self.block_size), split=split)
+        ctx = ForwardContext(FlashInferMetadata(self.slot_mapping[:bs], wrapper, bs), self.kv_cache,
+                             self.backend, self.moe_executor, ops=self.ops)
+
+        def run() -> torch.Tensor:
+            return self.model(self.input_ids[:bs], self.positions[:bs], ctx)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            out = run()
+        return wrapper, graph, out
+
     @torch.inference_mode()
     def _capture_all(self) -> None:
         pool = torch.cuda.graph_pool_handle()
-        device = self.backend.device
+        min_nosplit = getattr(self.backend, "nosplit_min_batch", None)
         for bs in reversed(self.sizes):
-            wrapper = self.backend.make_decode_wrapper(
-                paged_kv_indptr_buffer=torch.zeros(bs + 1, dtype=torch.int32, device=device),
-                paged_kv_indices_buffer=torch.zeros(bs * self.max_pages_per_seq, dtype=torch.int32, device=device),
-                paged_kv_last_page_len_buffer=torch.zeros(bs, dtype=torch.int32, device=device),
-            )
-            self.backend.plan_decode(wrapper, paged_layout(self._dummy(bs), self.block_size))
-            ctx = ForwardContext(FlashInferMetadata(self.slot_mapping[:bs], wrapper, bs), self.kv_cache,
-                                 self.backend, self.moe_executor, ops=self.ops)
-
-            def run(bs=bs, ctx=ctx) -> torch.Tensor:
-                return self.model(self.input_ids[:bs], self.positions[:bs], ctx)
-
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    run()
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
-                out = run()
-            self.wrappers[bs], self.graphs[bs], self.outputs[bs] = wrapper, graph, out
+            self.wrappers[bs], self.graphs[bs], self.outputs[bs] = self._capture(bs, pool, split=True)
+            if min_nosplit is not None and bs >= min_nosplit:
+                self.nosplit[bs] = self._capture(bs, pool, split=False)
         torch.cuda.synchronize()
-        logger.info("captured CUDA graphs for decode batch sizes %s", self.sizes)
+        logger.info("captured CUDA graphs for decode batch sizes %s (also without KV split: %s)",
+                    self.sizes, sorted(self.nosplit))
 
     # ------------------------------------------------------------------ replay
     def can_run(self, num_seqs: int) -> bool:
@@ -124,8 +137,14 @@ class CudaGraphRunner:
         self.positions[:bs].copy_(layout.positions, non_blocking=True)
         self.slot_mapping[:bs].copy_(layout.slot_mapping, non_blocking=True)
         TIMER.mark("graph_copies")
-        self.backend.plan_decode(self.wrappers[bs], layout)
+        variant = self.nosplit.get(bs)
+        if variant is not None and max(start + n for _, start, n in seqs) <= self.backend.nosplit_max_len:
+            wrapper, graph, out = variant
+            self.backend.plan_decode(wrapper, layout, split=False)
+        else:
+            wrapper, graph, out = self.wrappers[bs], self.graphs[bs], self.outputs[bs]
+            self.backend.plan_decode(wrapper, layout)
         TIMER.mark("graph_plan")
-        self.graphs[bs].replay()
+        graph.replay()
         TIMER.mark("graph_replay")
-        return self.outputs[bs][:b]
+        return out[:b]

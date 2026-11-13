@@ -85,7 +85,11 @@ class LlamaFamilyForCausalLM(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         ctx.positions = positions
-        hidden = self.model.embed_tokens(input_ids)
+        # nn.Embedding's index_select kernel grows with the row count at decode sizes (RTX 3090, CUDA
+        # graph: 1.8 / 5.3 / 9.4 us for 1 / 8 / 16 rows) while indexing stays at 1.4 us from 2 rows
+        # (2.8 us for 1); the same from 64 rows on
+        emb = self.model.embed_tokens
+        hidden = emb(input_ids) if input_ids.numel() == 1 else emb.weight[input_ids]
         residual = None
         for layer in self.model.layers:
             hidden, residual = layer(hidden, residual, self.rotary_emb, ctx)
@@ -93,7 +97,9 @@ class LlamaFamilyForCausalLM(nn.Module):
         hidden, _ = ctx.ops.fused_add_rms_norm(hidden, residual, norm.weight, norm.eps)
         return hidden
 
-    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+    def compute_logits(self, hidden: torch.Tensor, upcast: bool = True) -> torch.Tensor:
+        """``upcast=False`` keeps the model dtype (an argmax needs no float32 copy: the conversion
+        is exact, so greedy picks the same token)."""
         weight = self.model.embed_tokens.weight if self.lm_head is None else self.lm_head.weight
         table = getattr(self, "gemv_table", None)  # set by tandem.layers.triton_gemv.install
         if table:
@@ -102,7 +108,7 @@ class LlamaFamilyForCausalLM(nn.Module):
             logits = linear(hidden, weight, table)
         else:
             logits = torch.nn.functional.linear(hidden, weight)
-        return logits if logits.dtype == torch.float64 else logits.float()
+        return logits if logits.dtype == torch.float64 or not upcast else logits.float()
 
     def moe_blocks(self) -> dict[int, SparseMoeBlock]:
         return {i: layer.mlp for i, layer in enumerate(self.model.layers) if layer.is_moe}

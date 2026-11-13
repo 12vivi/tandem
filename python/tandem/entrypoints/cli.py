@@ -31,7 +31,9 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-small-batch-gemv", action="store_true",
                    help="keep cuBLAS for the decoder projections at batch <= 8")
     p.add_argument("--no-small-batch-attention", action="store_true",
-                   help="keep FlashInfer's decode attention at batch 1-2")
+                   help="keep FlashInfer's decode attention at batch 1-2, and its split-KV plan at batch >= 8")
+    p.add_argument("--no-small-batch-norm", action="store_true",
+                   help="keep FlashInfer's residual add + RMSNorm at decode batch sizes")
     p.add_argument("--spec", choices=["none", "ngram"], default="none", help="speculative decoding method")
     p.add_argument("--num-spec-tokens", type=int, default=4)
     p.add_argument("--hybrid", action="store_true", help="three-path MoE expert execution")
@@ -68,6 +70,7 @@ def _engine_config(args):
         fused_prologue=not args.no_fused_prologue,
         small_batch_gemv=not args.no_small_batch_gemv,
         small_batch_attention=not args.no_small_batch_attention,
+        small_batch_norm=not args.no_small_batch_norm,
         speculative=SpeculativeConfig(method=args.spec, num_speculative_tokens=args.num_spec_tokens),
         hybrid=HybridConfig(enabled=args.hybrid, gpu_expert_slots=args.gpu_expert_slots,
                             vram_budget_gb=args.vram_budget_gb, hw_profile=args.hw_profile),

@@ -27,7 +27,8 @@ SHAPES = {
              "lm_head": (151936, 1024)},
     "1.7b": {"qkv": (4096, 2048), "o": (2048, 2048), "gate_up": (12288, 2048), "down": (2048, 6144),
              "lm_head": (151936, 2048)},
-    "8b": {"qkv": (6144, 4096), "o": (4096, 4096), "gate_up": (24576, 4096), "down": (4096, 12288)},
+    "8b": {"qkv": (6144, 4096), "o": (4096, 4096), "gate_up": (24576, 4096), "down": (4096, 12288),
+           "lm_head": (151936, 4096)},  # lm_head is also the float16 head of Qwen3-8B-AWQ (--dtype float16)
 }
 
 
@@ -80,10 +81,11 @@ def main() -> None:
     ap.add_argument("--ms", default="1,2,4,8")
     ap.add_argument("--projs", default="", help="subset, e.g. qkv,o (default: all)")
     ap.add_argument("--sweep", action="store_true", help="search block / warp / stage configs")
+    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     ap.add_argument("--save", default="")
     a = ap.parse_args()
     dev = torch.device("cuda")
-    dtype = torch.bfloat16
+    dtype = getattr(torch, a.dtype)
     torch.manual_seed(0)
     for model in a.models.split(","):
         for proj, (n, k) in SHAPES[model].items():
@@ -113,7 +115,8 @@ def main() -> None:
                         continue
                     if best is None or us < best[0]:
                         best = (us, cfg)
-                rec = {"model": model, "proj": proj, "n": n, "k": k, "m": m, "weight_mb": round(nbytes / 1e6, 2),
+                rec = {"model": model, "proj": proj, "dtype": a.dtype, "n": n, "k": k, "m": m,
+                       "weight_mb": round(nbytes / 1e6, 2),
                        "cublas_us": round(cublas, 2), "cublas_gbps": round(nbytes / cublas / 1e3, 1),
                        "triton_us": round(best[0], 2), "triton_gbps": round(nbytes / best[0] / 1e3, 1),
                        "speedup": round(cublas / best[0], 3), "config": dict(zip(("block_n", "block_k", "num_warps", "num_stages",

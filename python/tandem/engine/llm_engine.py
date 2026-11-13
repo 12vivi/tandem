@@ -100,9 +100,12 @@ class LLMEngine:
                                                       bs, self.dtype, self.device)
             if config.small_batch_attention and config.fused_prologue:
                 attn_backend.enable_triton_decode()
+            if config.small_batch_attention:
+                attn_backend.enable_decode_nosplit()
         else:
             attn_backend = TorchAttentionBackend()
-        ops = make_ops(self.backend_name, fused_prologue=config.fused_prologue and self.backend_name == "flashinfer")
+        ops = make_ops(self.backend_name, fused_prologue=config.fused_prologue and self.backend_name == "flashinfer",
+                       small_batch_norm=config.small_batch_norm)
         self.num_gemv_layers = self.num_fused_layers = 0
         if self.backend_name == "flashinfer" and config.small_batch_gemv and self.dtype in (torch.float16, torch.bfloat16):
             from tandem.layers import triton_gemv

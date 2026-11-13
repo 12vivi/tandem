@@ -211,8 +211,9 @@ def gemv(
 
 # ---------------------------------------------------------------------------- dispatch
 # Config per GPU and (N, K, M bucket): (block_n, block_k, num_warps, num_stages, defer). Only
-# shapes where the Triton kernel beat cuBLAS by >= 3% in benchmarks/bench_gemv.py are listed;
-# everything else keeps cuBLAS. M buckets are the CUDA-graph decode batch sizes 1, 2, 4, 8.
+# shapes where the Triton kernel beat cuBLAS by >= 3% in benchmarks/bench_gemv.py are listed
+# (one exception, the 8B lm_head, see its entries); everything else keeps cuBLAS. M buckets are
+# the CUDA-graph decode batch sizes 1, 2, 4, 8.
 Config = tuple[int, int, int, int, int]  # ..., variant (gemv's defer)
 # Measured 2026-11-13 (benchmarks/results/p2-gemv*.jsonl), best of all sweeps per shape. Variant
 # 0 / 1: CUDA-core kernel (reduce per chunk / deferred), 2: tensor-core kernel (x padded to 16
@@ -256,6 +257,12 @@ CONFIGS: dict[str, dict[tuple[int, int, int], Config]] = {
         (151936, 1024, 4): (4, 1024, 2, 2, 0),  # 0.6b lm_head: x1.04, 882 GB/s
         (151936, 2048, 1): (2, 1024, 4, 2, 0),  # 1.7b lm_head: x1.03, 891 GB/s
         (151936, 2048, 2): (2, 1024, 4, 2, 0),  # 1.7b lm_head: x1.03, 889 GB/s
+        # 8b lm_head (BF16, and the float16 head of the AWQ model): x1.018-1.027 in all 8 (dtype, M)
+        # cells of p2-gemv-lmhead.jsonl, under the 3% bar but 26-38 us per call on a 1.4 ms kernel
+        (151936, 4096, 1): (1, 512, 1, 3, 1),  # x1.02, 893 GB/s
+        (151936, 4096, 2): (1, 1024, 4, 3, 1),  # x1.03, 891 GB/s
+        (151936, 4096, 4): (32, 128, 4, 3, 2),  # x1.02, 885 GB/s
+        (151936, 4096, 8): (32, 128, 4, 3, 2),  # x1.03, 881 GB/s
     },
 }
 

@@ -119,8 +119,10 @@ class ModelRunner:
             return InFlightStep(sched, results={})
         if len(logit_rows) != offset:
             hidden = hidden[torch.tensor(logit_rows, dtype=torch.long).to(self.device, non_blocking=True)]
-        logits = self.model.compute_logits(hidden)
         reqs = [r for r, _ in owners]
+        # all-greedy steps sample with one argmax: on the model-dtype logits, no float32 copy
+        greedy = all(r.sampling_params.greedy and not r.spec_token_ids for r in reqs)
+        logits = self.model.compute_logits(hidden, upcast=not greedy)
 
         if any(r.spec_token_ids for r in reqs):  # speculative verification: synchronous
             return InFlightStep(sched, results=self._verify(logits, owners))

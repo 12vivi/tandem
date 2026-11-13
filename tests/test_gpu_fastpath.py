@@ -234,6 +234,39 @@ def test_greedy_with_fused_prologue(tiny_path, tiny_fp32):
         assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_triton_fused_add_rmsnorm_matches_flashinfer(dtype):
+    """Same semantics as FlashInfer's fused_add_rmsnorm: the residual bit-identical, the output
+    within one rounding of the float32 math."""
+    pytest.importorskip("triton")
+    flashinfer = pytest.importorskip("flashinfer")
+    from tandem.layers.triton_ops import fused_add_rmsnorm
+
+    torch.manual_seed(0)
+    for m, h in ((1, 1024), (3, 2048), (8, 4096), (64, 4096), (5, 1000)):
+        x, r = torch.randn(m, h, device="cuda", dtype=dtype), torch.randn(m, h, device="cuda", dtype=dtype)
+        w = (1.0 + 0.1 * torch.randn(h, device="cuda")).to(dtype)
+        s32 = x.float() + r.float()
+        ref = s32 * torch.rsqrt(s32.pow(2).mean(-1, keepdim=True) + 1e-6) * w.float()
+        xa, ra, xb, rb = x.clone(), r.clone(), x.clone(), r.clone()
+        flashinfer.norm.fused_add_rmsnorm(xa, ra, w, 1e-6)
+        fused_add_rmsnorm(xb, rb, w, 1e-6)
+        assert torch.equal(rb, ra) and torch.equal(rb, s32.to(dtype)), (m, h)
+        assert torch.allclose(xb.float(), ref, atol=2e-2, rtol=1e-2), (m, h, (xb.float() - ref).abs().max())
+        assert torch.allclose(xb.float(), xa.float(), atol=2e-2, rtol=1e-2), (m, h)
+
+
+def test_greedy_with_small_batch_norm(tiny_path, tiny_fp32):
+    pytest.importorskip("triton")
+    ps = prompts(6, [5, 17, 40, 9, 23, 12], vocab=VOCAB)
+    plain = make(tiny_path, small_batch_norm=False).generate(ps, GREEDY)
+    eng = make(tiny_path)
+    out = eng.generate(ps, GREEDY)
+    assert eng.runner.ops._triton_norm is not None and eng.runner.num_graph_steps > 0
+    for p, a, b in zip(ps, plain, out):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
 @pytest.mark.parametrize("defer", [False, True], ids=["reduce_each", "defer"])
 def test_small_batch_gemv_matches_linear(defer):
     pytest.importorskip("triton")
@@ -348,6 +381,38 @@ def test_greedy_with_triton_decode_attention(tiny_path, tiny_fp32):
         assert eng.runner.attn_backend.triton_decode_nsplit  # on by default (used only for GQA 2)
         for p, a, b in zip(ps, base, out):
             assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
+def test_greedy_with_decode_nosplit(tiny_path, tiny_fp32):
+    """Decode batches >= 8 also get a CUDA graph planned without KV split (tensor-core decode,
+    GQA >= 4), replayed while the longest context is <= nosplit_max_len. With the threshold at 32
+    and prompts up to 19 tokens, the 10 requests (bucket 16) cross it mid-generation, so steps
+    switch from that graph to the split one; outputs match a split-only engine within near-ties."""
+    ps = prompts(10, [5, 9, 17, 3, 12, 15, 8, 11, 19, 14], vocab=VOCAB)
+    base = make(tiny_path, small_batch_attention=False).generate(ps, GREEDY)
+    eng = make(tiny_path)
+    backend, graphs = eng.runner.attn_backend, eng.runner.graph_runner
+    tensor_core = backend.num_qo_heads // backend.num_kv_heads >= 4
+    assert sorted(graphs.nosplit) == ([8, 16] if tensor_core else [])
+    backend.nosplit_max_len = 32
+
+    class Counted:  # counts replays of one bucket-16 graph
+        def __init__(self, graph):
+            self.graph, self.n = graph, 0
+
+        def replay(self):
+            self.n += 1
+            self.graph.replay()
+
+    split = graphs.graphs[16] = Counted(graphs.graphs[16])
+    if tensor_core:
+        wrapper, graph, out16 = graphs.nosplit[16]
+        nosplit = Counted(graph)
+        graphs.nosplit[16] = (wrapper, nosplit, out16)
+    out = eng.generate(ps, GREEDY)
+    assert split.n > 0 and (not tensor_core or nosplit.n > 0)  # both graphs ran
+    for p, a, b in zip(ps, base, out):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
 
 
 MODEL = os.environ.get("TANDEM_TEST_MODEL")

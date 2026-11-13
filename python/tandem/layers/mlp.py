@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -31,8 +33,14 @@ class MergedGatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.gate_up_proj = make_linear(hidden_size, 2 * intermediate_size, False, quant)
         self.down_proj = make_linear(intermediate_size, hidden_size, False, quant)
+        # AWQ: the gate_up kernel applies SwiGLU in its epilogue (tandem.layers.awq.W4Linear);
+        # TANDEM_W4_FUSE_ACT=0 keeps the separate activation kernel (A/B comparisons)
+        enable = getattr(self.gate_up_proj, "enable_silu_mul", None)
+        self.fused_act = bool(enable is not None and os.environ.get("TANDEM_W4_FUSE_ACT", "1") != "0" and enable())
 
     def forward(self, x: torch.Tensor, ops) -> torch.Tensor:
+        if self.fused_act:
+            return self.down_proj(self.gate_up_proj(x))
         return self.down_proj(ops.silu_and_mul(self.gate_up_proj(x)))
 
 

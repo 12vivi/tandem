@@ -109,6 +109,15 @@ tandem 另有两个诊断开关，默认关闭，通过 `--env` 传给服务：
   - 客户端设 `BENCH_DUMP_DIR=<目录>` 后，`bench_serving.py` 会把每个请求的发送时间、TTFT、各 token 间隔写进这个目录。
   - 两边都用 `perf_counter`（Linux 上是 CLOCK_MONOTONIC），时间可以直接对齐。P1 对齐报告 §4 就是这样查清突发请求的处理过程的。
 
+### 内核微基准
+
+都在 CUDA graph 里计时，并轮换多份权重或 KV（总量远大于 6 MB 的 L2），保证每次都从显存读：
+- `bench_gemv.py`：BF16 小 batch GEMV（Triton）各配置 vs cuBLAS，结果填 `tandem/layers/triton_gemv.py` 的配置表；`bench_gemv_fused.py` 是融合 norm / 激活的变体。
+- `bench_decode_attn.py`：FlashInfer decode attention 的几种调用方式和 Triton split-KV（`--triton`），`--heads 32,8,128 --dtype float16` 测 8B 形状。
+- `bench_w4.py`：W4A16 内核（CUDA 核心 `w4_gemv`、tensor core `w4_mma`）在 8B AWQ 各投影上的最优配置，结果填 `tandem/layers/awq.py` 的 `W4_KERNELS`；`--act` 另测 gate_up 融合 SwiGLU 收尾的版本。第一次运行会编译 CUDA 扩展，要设 `CUDA_HOME` 并把 nvcc 和 gcc 11 放进 PATH（同 `--env` 的设置）。
+- `bench_norm.py`：残差加 RMSNorm，FlashInfer 与 Triton（`tandem/layers/triton_ops.py`）在 decode batch 下的对比，并检查两者结果一致。
+- `bench_gemv.py --models 8b --projs lm_head --dtype float16`：8B 的 lm_head（AWQ 模型的 FP16 头）。
+
 ## 6. 公平性检查清单
 
 - 固定版本：vLLM 0.33.0、SGLang 0.5.23、KTransformers v0.7.2（配 `sglang-kt`）、llama.cpp 固定 build；记录驱动、CUDA、PyTorch 版本。

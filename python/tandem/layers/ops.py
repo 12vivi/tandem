@@ -67,7 +67,12 @@ class FlashInferOps:
 
     name = "flashinfer"
 
-    def __init__(self, fused_prologue: bool = False) -> None:
+    # residual add + RMSNorm through the Triton kernel up to this many rows (decode batches):
+    # 1.2-1.7x faster than FlashInfer's in a CUDA graph at 1-64 rows, hidden 1024-4096
+    # (benchmarks/bench_norm.py, p2-norm.jsonl, RTX 3090); larger batches (prefill) keep FlashInfer
+    TRITON_NORM_MAX_ROWS = 64
+
+    def __init__(self, fused_prologue: bool = False, small_batch_norm: bool = False) -> None:
         import flashinfer.activation
         import flashinfer.norm
         import flashinfer.rope
@@ -75,6 +80,14 @@ class FlashInferOps:
         self._norm = flashinfer.norm
         self._act = flashinfer.activation
         self._rope = flashinfer.rope
+        self._triton_norm = None
+        if small_batch_norm:
+            try:
+                from tandem.layers.triton_ops import fused_add_rmsnorm
+            except ImportError:
+                pass
+            else:
+                self._triton_norm = fused_add_rmsnorm
         # QK-norm + RoPE + KV write as one Triton kernel (tandem.layers.triton_ops)
         self.fused_prologue = False
         if fused_prologue:
@@ -96,7 +109,11 @@ class FlashInferOps:
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # in place: residual <- x + residual, x <- rms_norm(residual)
-        self._norm.fused_add_rmsnorm(x, residual, weight, eps)
+        if (self._triton_norm is not None and x.dim() == 2 and x.shape[0] <= self.TRITON_NORM_MAX_ROWS
+                and x.stride(-1) == 1 and residual.stride(-1) == 1):
+            self._triton_norm(x, residual, weight, eps)
+        else:
+            self._norm.fused_add_rmsnorm(x, residual, weight, eps)
         return x, residual
 
     def silu_and_mul(self, x: torch.Tensor) -> torch.Tensor:
@@ -114,9 +131,9 @@ class FlashInferOps:
         return q, k
 
 
-def make_ops(name: str, fused_prologue: bool = False):
+def make_ops(name: str, fused_prologue: bool = False, small_batch_norm: bool = False):
     if name == "torch":
         return TorchOps()
     if name == "flashinfer":
-        return FlashInferOps(fused_prologue=fused_prologue)
+        return FlashInferOps(fused_prologue=fused_prologue, small_batch_norm=small_batch_norm)
     raise ValueError(f"unknown ops backend {name!r}")

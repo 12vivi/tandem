@@ -1,6 +1,8 @@
-"""Fused attention prologue (design doc §4.3): QK-norm + RoPE + KV-cache write in one kernel.
+"""Small Triton kernels of the FlashInfer path: the fused attention prologue (design doc §4.3:
+QK-norm + RoPE + KV-cache write in one kernel) and residual add + RMSNorm for decode batches.
 
-Reads the fused ``qkv_proj`` output ``[T, (nh + 2 * nkv) * hd]`` directly and, per (token, head):
+The prologue reads the fused ``qkv_proj`` output ``[T, (nh + 2 * nkv) * hd]`` directly and, per
+(token, head):
   q heads  RMSNorm (Qwen3 QK-norm) -> RoPE (NeoX halves) -> q_out [T, nh, hd]
   k heads  RMSNorm -> RoPE -> k_cache[slot]
   v heads  -> v_cache[slot]
@@ -94,3 +96,29 @@ def qkv_prologue(
         num_warps=1,
     )
     return q
+
+
+@triton.jit
+def _fused_add_rmsnorm_kernel(x_ptr, r_ptr, w_ptr, stride_x, stride_r, eps, N: tl.constexpr, BLOCK: tl.constexpr):
+    """One row per program: s = x + r (float32); r <- s; x <- s * rsqrt(mean(s^2) + eps) * w."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    xp = x_ptr + row * stride_x + offs
+    rp = r_ptr + row * stride_r + offs
+    s = tl.load(xp, mask=mask, other=0.0).to(tl.float32) + tl.load(rp, mask=mask, other=0.0).to(tl.float32)
+    tl.store(rp, s.to(r_ptr.dtype.element_ty), mask=mask)
+    rstd = tl.rsqrt(tl.sum(s * s, axis=0) / N + eps)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(xp, (s * rstd * w).to(x_ptr.dtype.element_ty), mask=mask)
+
+
+def fused_add_rmsnorm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+                      num_warps: int = 0) -> None:
+    """In place, FlashInfer's semantics (float32 sum, the residual stored in its dtype, the output
+    from the unrounded sum): residual <- x + residual, x <- rms_norm(residual) * weight. One program
+    per row, for the small decode batches where FlashInfer's kernel does not spread rows."""
+    m, n = x.shape
+    block = triton.next_power_of_2(n)
+    _fused_add_rmsnorm_kernel[(m,)](x, residual, weight, x.stride(0), residual.stride(0), eps, N=n, BLOCK=block,
+                                    num_warps=num_warps or (8 if block <= 1024 else 16))

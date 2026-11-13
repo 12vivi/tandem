@@ -16,7 +16,7 @@ tables (two small kernels per layer; a fused QK-norm + RoPE + KV-write kernel is
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import torch
 
@@ -105,9 +105,22 @@ class FlashInferAttentionBackend:
         # 1.2-1.5x faster than FlashInfer's decode at batch 1-2 and 0.5-1K context, within 2.5% up to
         # 8K; from batch 4 on FlashInfer is as fast or faster.
         self.triton_decode_nsplit: dict[tuple[int, int], int] = {}
+        # Decode batches >= nosplit_min_batch also get a CUDA graph whose wrapper is planned with
+        # disable_split_kv: one CTA per (request, KV head), no partial results and no merge kernel.
+        # A step uses it when its longest context is <= nosplit_max_len tokens. In CUDA-graph mode
+        # FlashInfer's default plan always splits and merges; with Qwen3-8B heads on the RTX 3090
+        # (benchmarks/bench_decode_attn.py, p2-attn-8b-nosplit.jsonl) not splitting is 5-9% faster
+        # at batch 8 and 0.5-1K context and equal at 2K, but 4% slower at 4K, and 25-47% slower at
+        # batch 4 (too few CTAs). Measured for the tensor-core decode path (GQA >= 4) only.
+        self.nosplit_min_batch: Optional[int] = None
+        self.nosplit_max_len = 2048
 
     def enable_triton_decode(self) -> None:
         self.triton_decode_nsplit = {(2, 1): 32, (2, 2): 16}
+
+    def enable_decode_nosplit(self) -> None:
+        if self.use_tensor_cores:
+            self.nosplit_min_batch = 8
 
     def _guarded_plan(self, wrapper: Any, plan) -> None:
         """plan() writes the wrapper's pinned host buffer and queues a copy to the device. With
@@ -128,7 +141,9 @@ class FlashInferAttentionBackend:
             **graph_buffers,
         )
 
-    def plan_decode(self, wrapper: Any, layout: PagedLayout) -> None:
+    def plan_decode(self, wrapper: Any, layout: PagedLayout, split: bool = True) -> None:
+        """``split=False``: disable_split_kv. A CUDA-graph wrapper must be planned the same way at
+        every replay as at capture (the captured launches differ: with or without the merge)."""
         # A CUDA-graph decode wrapper copies host kv_indices into its buffer with a blocking copy
         # (FlashInfer 0.6: non_blocking only for device tensors), i.e. a stream sync per step that
         # makes the host wait for the running step and so defeats overlap scheduling. Hand it a
@@ -137,7 +152,7 @@ class FlashInferAttentionBackend:
         self._guarded_plan(wrapper, lambda: wrapper.plan(
             layout.kv_indptr, indices, layout.kv_last_page_len,
             self.num_qo_heads, self.num_kv_heads, self.head_dim, self.block_size,
-            q_data_type=self.dtype, kv_data_type=self.dtype, sm_scale=self.scale,
+            q_data_type=self.dtype, kv_data_type=self.dtype, sm_scale=self.scale, disable_split_kv=not split,
         ))
 
     def prepare(

@@ -66,7 +66,11 @@ class EngineConfig:
     # it beats cuBLAS on this GPU (tandem.layers.triton_gemv.CONFIGS)
     small_batch_gemv: bool = True
     # FlashInfer path: decode attention at batch 1-2 (GQA group 2) through the Triton split-KV
-    # kernel (tandem.layers.triton_decode_attn) instead of FlashInfer's decode
+    # kernel (tandem.layers.triton_decode_attn) instead of FlashInfer's decode; and, for GQA >= 4,
+    # CUDA graphs without KV split for decode batches >= 8 (FlashInferAttentionBackend)
     small_batch_attention: bool = True
+    # FlashInfer path: residual add + RMSNorm at batch <= 64 through a Triton kernel (one program
+    # per row; tandem.layers.triton_ops.fused_add_rmsnorm) instead of FlashInfer's
+    small_batch_norm: bool = True
     speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
     hybrid: HybridConfig = field(default_factory=HybridConfig)

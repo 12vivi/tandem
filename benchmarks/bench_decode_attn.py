@@ -21,9 +21,9 @@ import flashinfer
 import torch
 
 
-def run_case(nqo: int, nkv: int, hd: int, bs: int, ctx: int, variant: str, layers: int = 28, page: int = 16) -> float:
+def run_case(nqo: int, nkv: int, hd: int, bs: int, ctx: int, variant: str, layers: int = 28, page: int = 16,
+             dt: torch.dtype = torch.bfloat16) -> float:
     dev = torch.device("cuda")
-    dt = torch.bfloat16
     pages_per = (ctx + page - 1) // page
     num_pages = bs * pages_per
     caches = [(torch.randn(num_pages, page, nkv, hd, device=dev, dtype=dt),
@@ -96,19 +96,23 @@ def main() -> None:
     ap.add_argument("--contexts", default="512,768,1024")
     ap.add_argument("--variants", default="cuda-core,cuda-core-nosplit,tensor-core")
     ap.add_argument("--triton", action="store_true", help="add triton-ns{4..32}-pp{1,2}-w{1,2,4} variants")
+    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    ap.add_argument("--layers", type=int, default=28)
     ap.add_argument("--save", default="")
     a = ap.parse_args()
+    dt = getattr(torch, a.dtype)
     nqo, nkv, hd = (int(x) for x in a.heads.split(","))
     for bs in (int(x) for x in a.batches.split(",")):
         for ctx in (int(x) for x in a.contexts.split(",")):
             kv_mb = bs * ctx * nkv * hd * 2 * 2 / 1e6
-            rec = {"heads": [nqo, nkv, hd], "batch": bs, "context": ctx, "kv_mb_per_layer": round(kv_mb, 2)}
+            rec = {"heads": [nqo, nkv, hd], "dtype": a.dtype, "batch": bs, "context": ctx,
+                   "kv_mb_per_layer": round(kv_mb, 2)}
             variants = a.variants.split(",")
             if a.triton:
                 variants += [f"triton-ns{ns}-pp{pp}-w{nw}" for ns in (4, 8, 16, 32) for pp in (1, 2) for nw in (1, 2, 4)]
             for v in variants:
                 try:
-                    us = run_case(nqo, nkv, hd, bs, ctx, v)
+                    us = run_case(nqo, nkv, hd, bs, ctx, v, a.layers, dt=dt)
                     rec[v] = round(us, 2)
                 except Exception as exc:  # noqa: BLE001 - some variants are unsupported for some shapes
                     rec[v] = f"error: {str(exc).splitlines()[0][:80]}"
