@@ -92,6 +92,8 @@ class LLMEngine:
 
             attn_backend = FlashInferAttentionBackend(mc.num_attention_heads, mc.num_key_value_heads, mc.head_dim,
                                                       bs, self.dtype, self.device)
+            if config.small_batch_attention and config.fused_prologue:
+                attn_backend.enable_triton_decode()
         else:
             attn_backend = TorchAttentionBackend()
         ops = make_ops(self.backend_name, fused_prologue=config.fused_prologue and self.backend_name == "flashinfer")

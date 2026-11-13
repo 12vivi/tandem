@@ -32,6 +32,18 @@ def run_case(nqo: int, nkv: int, hd: int, bs: int, ctx: int, variant: str, layer
     indptr = torch.arange(0, bs + 1, dtype=torch.int32) * pages_per
     indices = torch.arange(num_pages, dtype=torch.int32)
     last = torch.full((bs,), ctx - (pages_per - 1) * page, dtype=torch.int32)
+    if variant.startswith("triton"):  # triton-ns{NSPLIT}-pp{PAGES_PER_ITER}-w{WARPS}
+        from tandem.layers.triton_decode_attn import decode_attention
+
+        ns, pp, nw = (int(x[2:] if x.startswith(("ns", "pp")) else x[1:]) for x in variant.split("-")[1:])
+        dev_indptr, dev_indices, dev_last = indptr.to(dev), indices.to(dev), last.to(dev)
+        outs = [torch.empty_like(q) for _ in range(layers)]
+
+        def step() -> None:
+            for (k, v), o in zip(caches, outs):
+                decode_attention(q, k.view(-1, nkv, hd), v.view(-1, nkv, hd), dev_indptr, dev_indices, dev_last,
+                                 page, hd ** -0.5, nsplit=ns, pages_per_iter=pp, num_warps=nw, out=o)
+        return _time_graph(step, layers)
     ws = torch.empty(256 << 20, dtype=torch.uint8, device=dev)
     tc = variant.startswith("tensor-core")
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -53,6 +65,10 @@ def run_case(nqo: int, nkv: int, hd: int, bs: int, ctx: int, variant: str, layer
         for (k, v), o in zip(caches, outs):
             wrapper.run(q, (k, v), out=o)
 
+    return _time_graph(step, layers)
+
+
+def _time_graph(step, layers: int) -> float:
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -78,8 +94,8 @@ def main() -> None:
     ap.add_argument("--heads", default="16,8,128", help="q heads, kv heads, head dim (Qwen3-0.6B / 1.7B)")
     ap.add_argument("--batches", default="1,4,8")
     ap.add_argument("--contexts", default="512,768,1024")
-    ap.add_argument("--variants", default="cuda-core,cuda-core-nosplit,tensor-core,tensor-core-s64,"
-                                          "tensor-core-s128,tensor-core-s256,tensor-core-s512")
+    ap.add_argument("--variants", default="cuda-core,cuda-core-nosplit,tensor-core")
+    ap.add_argument("--triton", action="store_true", help="add triton-ns{4..32}-pp{1,2}-w{1,2,4} variants")
     ap.add_argument("--save", default="")
     a = ap.parse_args()
     nqo, nkv, hd = (int(x) for x in a.heads.split(","))
@@ -87,7 +103,10 @@ def main() -> None:
         for ctx in (int(x) for x in a.contexts.split(",")):
             kv_mb = bs * ctx * nkv * hd * 2 * 2 / 1e6
             rec = {"heads": [nqo, nkv, hd], "batch": bs, "context": ctx, "kv_mb_per_layer": round(kv_mb, 2)}
-            for v in a.variants.split(","):
+            variants = a.variants.split(",")
+            if a.triton:
+                variants += [f"triton-ns{ns}-pp{pp}-w{nw}" for ns in (4, 8, 16, 32) for pp in (1, 2) for nw in (1, 2, 4)]
+            for v in variants:
                 try:
                     us = run_case(nqo, nkv, hd, bs, ctx, v)
                     rec[v] = round(us, 2)

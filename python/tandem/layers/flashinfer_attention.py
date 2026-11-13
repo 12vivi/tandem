@@ -100,6 +100,14 @@ class FlashInferAttentionBackend:
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace, "NHD")
         self.decode_wrapper = self.make_decode_wrapper()
         self._plan_events: dict[int, torch.cuda.Event] = {}
+        # (GQA group, decode batch) -> splits of tandem.layers.triton_decode_attn; empty = FlashInfer
+        # only. Measured on the RTX 3090 (benchmarks/bench_decode_attn.py, Qwen3-0.6B / 1.7B heads):
+        # 1.2-1.5x faster than FlashInfer's decode at batch 1-2 and 0.5-1K context, within 2.5% up to
+        # 8K; from batch 4 on FlashInfer is as fast or faster.
+        self.triton_decode_nsplit: dict[tuple[int, int], int] = {}
+
+    def enable_triton_decode(self) -> None:
+        self.triton_decode_nsplit = {(2, 1): 32, (2, 2): 16}
 
     def _guarded_plan(self, wrapper: Any, plan) -> None:
         """plan() writes the wrapper's pinned host buffer and queues a copy to the device. With
@@ -172,4 +180,15 @@ class FlashInferAttentionBackend:
 
     def attend(self, layer_id: int, q: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         """Attention only: the new K/V are already in the cache (fused prologue)."""
-        return ctx.attn.wrapper.run(q, self.paged_cache(ctx, layer_id))
+        wrapper = ctx.attn.wrapper
+        nsplit = self.triton_decode_nsplit.get((self.num_qo_heads // self.num_kv_heads, q.shape[0]))
+        if nsplit is not None and isinstance(wrapper, self.flashinfer.BatchDecodeWithPagedKVCacheWrapper):
+            from tandem.layers.triton_decode_attn import decode_attention
+
+            # the paged layout plan() just wrote into the wrapper's (CUDA-graph static) buffers
+            return decode_attention(
+                q, ctx.kv_cache.k[layer_id], ctx.kv_cache.v[layer_id], wrapper._paged_kv_indptr_buf,
+                wrapper._paged_kv_indices_buf, wrapper._paged_kv_last_page_len_buf, self.block_size, self.scale,
+                nsplit=nsplit, pages_per_iter=1, num_warps=1,
+            )
+        return wrapper.run(q, self.paged_cache(ctx, layer_id))

@@ -294,6 +294,62 @@ def test_greedy_with_small_batch_gemv(tiny_path, tiny_fp32, monkeypatch, force):
         assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
 
 
+@pytest.mark.parametrize("gqa", [2, 4])
+def test_triton_decode_attention_matches_reference(gqa):
+    """Split-KV decode attention against float32 math over the same paged cache: shuffled pages,
+    contexts that end mid-page, empty splits (more splits than pages)."""
+    pytest.importorskip("triton")
+    from tandem.layers.triton_decode_attn import decode_attention
+
+    torch.manual_seed(11)
+    hkv, d, page = 4, 128, 16
+    hq = hkv * gqa
+    num_pages = 64
+    k_cache = torch.randn(num_pages * page, hkv, d, device="cuda", dtype=torch.bfloat16)
+    v_cache = torch.randn(num_pages * page, hkv, d, device="cuda", dtype=torch.bfloat16)
+    for lens in ([1], [17, 300, 33], [5, 16, 64, 129, 200, 7, 31, 90]):
+        bsz = len(lens)
+        perm = torch.randperm(num_pages).tolist()
+        indptr, indices, last, pos = [0], [], [], 0
+        for n in lens:
+            npg = (n + page - 1) // page
+            indices += perm[pos:pos + npg]
+            pos += npg
+            indptr.append(indptr[-1] + npg)
+            last.append(n - (npg - 1) * page)
+        q = torch.randn(bsz, hq, d, device="cuda", dtype=torch.bfloat16)
+        args = (torch.tensor(indptr, dtype=torch.int32, device="cuda"),
+                torch.tensor(indices, dtype=torch.int32, device="cuda"),
+                torch.tensor(last, dtype=torch.int32, device="cuda"))
+        ref = torch.empty(bsz, hq, d, device="cuda")
+        for b, n in enumerate(lens):
+            slots = torch.cat([torch.arange(p * page, p * page + page) for p in indices[indptr[b]:indptr[b + 1]]])[:n]
+            k = k_cache[slots.cuda()].float().repeat_interleave(gqa, dim=1)  # [n, hq, d]
+            v = v_cache[slots.cuda()].float().repeat_interleave(gqa, dim=1)
+            w = torch.softmax(torch.einsum("hd,nhd->hn", q[b].float(), k) * d ** -0.5, dim=-1)
+            ref[b] = torch.einsum("hn,nhd->hd", w, v)
+        for nsplit, ppi, nw in ((1, 1, 2), (4, 2, 2), (16, 1, 1), (32, 4, 4)):
+            for fused_merge in (True, False):
+                for _ in range(2):  # twice: the in-kernel merge must leave its counters at zero
+                    out = decode_attention(q, k_cache, v_cache, *args, page, d ** -0.5, nsplit=nsplit,
+                                           pages_per_iter=ppi, num_warps=nw, fused_merge=fused_merge)
+                    assert torch.allclose(out.float(), ref, atol=2e-2, rtol=2e-2), (
+                        lens, nsplit, ppi, fused_merge, (out.float() - ref).abs().max())
+
+
+def test_greedy_with_triton_decode_attention(tiny_path, tiny_fp32):
+    """Decode attention at batch 1-2 through the Triton kernel (GQA 2) vs FlashInfer: same greedy
+    outputs within near-ties, single request and a pair (CUDA-graph buckets 1 and 2)."""
+    pytest.importorskip("triton")
+    for ps in (prompts(8, [23], vocab=VOCAB), prompts(9, [11, 70], vocab=VOCAB)):
+        base = make(tiny_path, small_batch_attention=False).generate(ps, GREEDY)
+        eng = make(tiny_path)
+        out = eng.generate(ps, GREEDY)
+        assert eng.runner.attn_backend.triton_decode_nsplit  # on by default (used only for GQA 2)
+        for p, a, b in zip(ps, base, out):
+            assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
 MODEL = os.environ.get("TANDEM_TEST_MODEL")
 
 

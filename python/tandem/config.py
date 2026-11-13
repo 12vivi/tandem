@@ -65,5 +65,8 @@ class EngineConfig:
     # FlashInfer path: decoder projections at batch <= 8 through the Triton small-batch GEMV where
     # it beats cuBLAS on this GPU (tandem.layers.triton_gemv.CONFIGS)
     small_batch_gemv: bool = True
+    # FlashInfer path: decode attention at batch 1-2 (GQA group 2) through the Triton split-KV
+    # kernel (tandem.layers.triton_decode_attn) instead of FlashInfer's decode
+    small_batch_attention: bool = True
     speculative: SpeculativeConfig = field(default_factory=SpeculativeConfig)
     hybrid: HybridConfig = field(default_factory=HybridConfig)
