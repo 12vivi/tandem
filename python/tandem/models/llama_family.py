@@ -38,7 +38,8 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(cfg, layer_id)
         self.is_moe = cfg.is_moe_layer(layer_id)
         self.mlp: nn.Module = (
-            SparseMoeBlock(cfg, layer_id) if self.is_moe else MergedGatedMLP(cfg.hidden_size, cfg.intermediate_size)
+            SparseMoeBlock(cfg, layer_id) if self.is_moe
+            else MergedGatedMLP(cfg.hidden_size, cfg.intermediate_size, cfg.quantization)
         )
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)

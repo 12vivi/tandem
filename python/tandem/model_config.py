@@ -25,6 +25,25 @@ _MODEL_TYPE_TO_ARCH = {
 
 
 @dataclass
+class QuantConfig:
+    """Weight-only quantization of a checkpoint (``quantization_config`` in config.json)."""
+
+    method: str  # "awq"
+    bits: int
+    group_size: int
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> Optional["QuantConfig"]:
+        if not d:
+            return None
+        method = d.get("quant_method")
+        if (method == "awq" and d.get("bits") == 4 and d.get("zero_point", True)
+                and d.get("version", "gemm").lower() == "gemm"):
+            return cls("awq", 4, int(d.get("group_size", 128)))
+        raise NotImplementedError(f"unsupported quantization_config: {d} (tandem reads 4-bit AWQ 'gemm' checkpoints)")
+
+
+@dataclass
 class ModelConfig:
     architecture: str
     family: str
@@ -50,6 +69,7 @@ class ModelConfig:
     mlp_only_layers: list[int] = field(default_factory=list)
     eos_token_ids: list[int] = field(default_factory=list)
     torch_dtype: Optional[str] = None
+    quantization: Optional[QuantConfig] = None
 
     @property
     def is_moe(self) -> bool:
@@ -121,6 +141,7 @@ class ModelConfig:
             mlp_only_layers=list(d.get("mlp_only_layers") or []),
             eos_token_ids=eos_ids,
             torch_dtype=d.get("torch_dtype") or d.get("dtype"),
+            quantization=QuantConfig.from_dict(d.get("quantization_config")),
         )
 
     @classmethod

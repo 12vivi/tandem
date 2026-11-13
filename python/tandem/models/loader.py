@@ -20,9 +20,13 @@ _FUSED_EXPERTS = re.compile(r"^(model\.layers\.\d+\.mlp\.experts)\.(gate_up_proj
 # (pattern, fused name, shards in row order). Dense-MLP names only: MoE experts are
 # "mlp.experts.E.gate_proj" and do not match.
 _STACKED = [
-    (re.compile(r"^(.*\.self_attn)\.(q|k|v)_proj\.(weight|bias)$"), "qkv_proj", ("q", "k", "v")),
-    (re.compile(r"^(model\.layers\.\d+\.mlp)\.(gate|up)_proj\.(weight)$"), "gate_up_proj", ("gate", "up")),
+    (re.compile(r"^(.*\.self_attn)\.(q|k|v)_proj\.(weight|bias|qweight|qzeros|scales)$"), "qkv_proj", ("q", "k", "v")),
+    (re.compile(r"^(model\.layers\.\d+\.mlp)\.(gate|up)_proj\.(weight|qweight|qzeros|scales)$"), "gate_up_proj",
+     ("gate", "up")),
 ]
+# AWQ tensors ([K, N/8] / [K/G, N/8] / [K/G, N]) have the output dimension second: shards are
+# columns, not rows
+_AWQ_SUFFIXES = (".qweight", ".qzeros", ".scales")
 
 
 def _stacked_target(name: str):
@@ -36,7 +40,11 @@ def _stacked_target(name: str):
 
 def _copy_shard(param: torch.Tensor, tensor: torch.Tensor, shard: str, shards: tuple, name: str) -> None:
     """Rows of the fused parameter, in shard order. qkv: q has its own size and k, v share
-    one; gate_up: both halves are equal. Offsets are derived from the fused size."""
+    one; gate_up: both halves are equal. Offsets are derived from the fused size. AWQ tensors
+    are fused along their columns (the output dimension)."""
+    if name.endswith(_AWQ_SUFFIXES):
+        _copy_shard(param.t(), tensor.t(), shard, shards, name[: name.rindex(".")] + ".weight")
+        return
     rows = tensor.shape[0]
     total = param.shape[0]
     if shards == ("q", "k", "v"):
@@ -60,6 +68,8 @@ def load_weights(model: nn.Module, model_path: str) -> None:
     if not files:
         raise FileNotFoundError(f"no *.safetensors files in {model_path}")
     params = dict(model.named_parameters())
+    # quantized layers keep their checkpoint tensors as buffers (tandem.layers.awq.W4Linear)
+    params.update({n: b for n, b in model.named_buffers() if n.endswith(_AWQ_SUFFIXES)})
     loaded: set[str] = set()
     unexpected: list[str] = []
     shards_seen: dict[str, set[str]] = {}

@@ -24,11 +24,13 @@ class MergedGatedMLP(nn.Module):
     kernel) as theirs. The loader fills ``gate_up_proj`` from the checkpoint's separate
     ``gate_proj`` / ``up_proj`` tensors."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self, hidden_size: int, intermediate_size: int, quant=None) -> None:
         super().__init__()
+        from tandem.layers.linear import make_linear
+
         self.intermediate_size = intermediate_size
-        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_up_proj = make_linear(hidden_size, 2 * intermediate_size, False, quant)
+        self.down_proj = make_linear(intermediate_size, hidden_size, False, quant)
 
     def forward(self, x: torch.Tensor, ops) -> torch.Tensor:
         return self.down_proj(ops.silu_and_mul(self.gate_up_proj(x)))

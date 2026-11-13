@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tandem.executor.forward_context import ForwardContext, build_attention_metadata
+from tandem.layers.linear import make_linear
 from tandem.layers.norm import RMSNorm
 from tandem.model_config import ModelConfig
 
@@ -69,8 +70,8 @@ class Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scale = cfg.head_dim**-0.5
         h = cfg.hidden_size
-        self.qkv_proj = nn.Linear(h, self.q_size + 2 * self.kv_size, bias=cfg.attention_bias)
-        self.o_proj = nn.Linear(self.q_size, h, bias=False)
+        self.qkv_proj = make_linear(h, self.q_size + 2 * self.kv_size, cfg.attention_bias, cfg.quantization)
+        self.o_proj = make_linear(self.q_size, h, False, cfg.quantization)
         self.qk_norm = cfg.qk_norm
         if cfg.qk_norm:  # Qwen3: per-head RMSNorm on q and k before RoPE
             self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)

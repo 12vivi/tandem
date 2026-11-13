@@ -66,6 +66,12 @@ class LLMEngine:
             self._place_for_hybrid(model)
         else:
             model.to(self.device)
+            if mc.quantization is not None:
+                from tandem.layers.linear import finalize_quantized
+
+                n = finalize_quantized(model, torch.cuda.get_device_name(self.device) if self.device.type == "cuda"
+                                       else None)
+                logger.info("%d %s %d-bit layers repacked", n, mc.quantization.method, mc.quantization.bits)
         self.model = model.eval()
 
         # ------------------------------------------------------------- KV cache
