@@ -50,6 +50,8 @@ class EngineConfig:
     num_kv_blocks: Optional[int] = None
     kv_cache_memory_gb: float = 1.0
     enable_prefix_caching: bool = True
+    # L2 of the KV cache (design doc §4.4): pinned host memory in GB (10^9 bytes); 0 = GPU only
+    host_kv_gb: float = 0.0
     seed: int = 0
     cpu_threads: int = 0  # torch intra-op threads; 0 keeps the torch default
     # "auto": FlashInfer kernels (attention, norms, SiLU-and-mul, RoPE) on CUDA with

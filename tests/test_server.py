@@ -49,11 +49,15 @@ def _events(resp):
 def test_completion_and_chat(tiny_model, kind):
     with _client(tiny_model, kind) as client:
         assert client.get("/health").json() == {"status": "ok"}
-        r = client.post("/v1/completions", json={"prompt": "hello", "max_tokens": 5, "temperature": 0, "ignore_eos": True})
+        req = {"prompt": "hello", "max_tokens": 5, "temperature": 0, "ignore_eos": True}
+        r = client.post("/v1/completions", json=req)
         body = r.json()
         assert r.status_code == 200
-        assert body["usage"] == {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}
+        assert body["usage"] == {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10,
+                                 "prompt_tokens_details": {"cached_tokens": 0}}
         assert body["choices"][0]["finish_reason"] == "length"
+        # the same prompt again: its first whole block (4 tokens) comes from the prefix cache
+        assert client.post("/v1/completions", json=req).json()["usage"]["prompt_tokens_details"] == {"cached_tokens": 4}
 
         r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "ignore_eos": True})
         assert r.status_code == 200

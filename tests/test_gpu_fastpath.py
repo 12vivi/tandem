@@ -432,3 +432,50 @@ def test_real_model_fast_path_matches_reference():
     hf = fp32_reference(MODEL)
     for p, r, f in zip(ids, ref, fast):
         assert_same_or_near_tie(hf, p, r.output_token_ids, f.output_token_ids, tol=1.0)
+
+
+def test_host_pool_cuda_copies_page_first():
+    """The page-copy kernel: host pages hold [layer][K, V][block] in order, and a round trip
+    into other GPU blocks reproduces them; copies run on the side stream behind queued work."""
+    from tandem.cache.host_pool import HostKVPool
+    from tandem.cache.kv_cache import KVCache
+
+    kv = KVCache(3, 9, 16, 2, 64, torch.bfloat16, torch.device("cuda"))
+    pool = HostKVPool(kv, 6)
+    if pool.ext is None:
+        pytest.skip("KV page-copy kernels did not build (no nvcc?)")
+    torch.manual_seed(0)
+    for t in kv.k + kv.v:
+        t.normal_()
+    before = [t.clone() for t in kv.k + kv.v]
+    ev = pool.to_host([1, 4, 7], [5, 0, 2])
+    ev.synchronize()
+    for layer in range(3):
+        for kvi, t in enumerate((kv.k[layer], kv.v[layer])):
+            for blk, page in ((1, 5), (4, 0), (7, 2)):
+                assert torch.equal(pool.data[page, layer, kvi], t[blk * 16 : (blk + 1) * 16].flatten().cpu())
+    torch.cuda._sleep(50_000_000)  # queued work on the compute stream: the load must wait for it
+    for t in kv.k + kv.v:
+        t[2 * 16 : 5 * 16].zero_()
+    pool.to_gpu([5, 0, 2], [2, 3, 4]).synchronize()
+    for t, b in zip(kv.k + kv.v, before):
+        for src, dst in ((1, 2), (4, 3), (7, 4)):
+            assert torch.equal(t[dst * 16 : (dst + 1) * 16], b[src * 16 : (src + 1) * 16])
+
+
+def test_greedy_with_host_tier(tiny_path, tiny_fp32):
+    """A prefix pushed out of a small GPU pool is loaded back from host memory asynchronously
+    (the request waits in the scheduler's loading list), with CUDA graphs on; outputs match the
+    GPU-only engine within near-ties."""
+    shared = prompts(11, [100], vocab=VOCAB)[0]
+    others = prompts(12, [60] * 4, vocab=VOCAB)
+    ps = [shared + [5], *others, shared + [6, 7]]
+    kw = dict(num_kv_blocks=12, max_num_batched_tokens=128)  # 192 tokens of GPU KV
+    base = [make(tiny_path, **kw).generate([p], GREEDY)[0] for p in ps]
+    eng = make(tiny_path, host_kv_gb=0.05, **kw)
+    assert eng.host_pool is not None and eng.host_pool.ext is not None
+    out = [eng.generate([p], GREEDY)[0] for p in ps]
+    assert out[-1].metrics["cached_tokens"] == 96  # 6 blocks of the shared prefix, from host memory
+    assert eng.radix.num_host_hit_tokens >= 96 and eng.runner.num_graph_steps > 0
+    for p, a, b in zip(ps, base, out):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)

@@ -84,7 +84,13 @@ class LLMEngine:
         self.kv_cache = KVCache(mc.num_hidden_layers, num_blocks + 1, bs, mc.num_key_value_heads, mc.head_dim,
                                 self.dtype, self.device)
         self.allocator = BlockAllocator(num_blocks)
-        self.radix = RadixCache(bs, self.allocator) if config.enable_prefix_caching else None
+        self.host_pool = None
+        if config.enable_prefix_caching and config.host_kv_gb > 0:  # L2: host-memory KV tier
+            from tandem.cache.host_pool import HostKVPool
+
+            per_page = KVCache.bytes_per_block(mc.num_hidden_layers, bs, mc.num_key_value_heads, mc.head_dim, self.dtype)
+            self.host_pool = HostKVPool(self.kv_cache, max(1, int(config.host_kv_gb * 1e9 // per_page)))
+        self.radix = RadixCache(bs, self.allocator, self.host_pool) if config.enable_prefix_caching else None
         self.scheduler = Scheduler(
             self.allocator, bs, config.max_num_seqs, config.max_num_batched_tokens, self.max_model_len, self.radix,
             policy=config.schedule_policy,
@@ -376,5 +382,9 @@ class LLMEngine:
         if self.radix is not None:
             s["prefix_cache_hit_rate"] = round(self.radix.hit_rate, 4)
             s["cached_blocks"] = self.radix.num_cached_blocks
+            if self.host_pool is not None:
+                s["host_hit_rate"] = round(self.radix.host_hit_rate, 4)
+                s["host_cached_pages"] = self.radix.num_host_pages
+                s["loading"] = len(self.scheduler.loading)
         s.update({f"moe_{k}": v for k, v in self.moe_executor.stats().items()})
         return s

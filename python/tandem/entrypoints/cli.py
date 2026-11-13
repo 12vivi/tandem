@@ -20,6 +20,8 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--kv-cache-gb", type=float, default=1.0)
     p.add_argument("--no-prefix-caching", action="store_true")
+    p.add_argument("--host-kv-gb", type=float, default=0.0,
+                   help="host-memory KV tier (L2, pinned) in GB; evicted prefixes stay there and load back on a hit")
     p.add_argument("--cpu-threads", type=int, default=0)
     p.add_argument("--attention-backend", choices=["auto", "torch", "flashinfer"], default="auto",
                    help="auto: FlashInfer kernels on CUDA (bf16 / fp16) when installed, else the PyTorch reference")
@@ -62,6 +64,7 @@ def _engine_config(args):
         block_size=args.block_size,
         kv_cache_memory_gb=args.kv_cache_gb,
         enable_prefix_caching=not args.no_prefix_caching,
+        host_kv_gb=args.host_kv_gb,
         cpu_threads=args.cpu_threads,
         attention_backend=args.attention_backend,
         cuda_graph=not args.no_cuda_graph,

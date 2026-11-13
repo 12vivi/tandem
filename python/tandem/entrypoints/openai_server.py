@@ -79,8 +79,12 @@ def _sse(obj: Any) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def _usage(prompt_tokens: int, completion_tokens: int) -> dict:
-    return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
+def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: Optional[int] = None) -> dict:
+    usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+             "total_tokens": prompt_tokens + completion_tokens}
+    if cached_tokens is not None:  # prefix-cache hit, as vLLM reports it (0 when nothing was cached)
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    return usage
 
 
 def _message_text(content: Union[str, list[dict[str, Any]], None]) -> str:
@@ -142,10 +146,11 @@ def build_app(async_engine: AsyncEngine, tokenizer: Any, model_name: str, defaul
         obj = "chat.completion" if chat else "text_completion"
 
         if not body.stream:
-            text, n_out, reason = "", 0, None
+            text, n_out, reason, cached = "", 0, None, None
             try:
                 async for out in async_engine.generate(prompt_ids, params, rid):
                     text, n_out, reason = out.text, out.num_output_tokens, out.finish_reason
+                    cached = out.metrics.get("cached_tokens", cached)
             except ValueError as exc:
                 return _error(400, str(exc))
             choice = (
@@ -153,18 +158,20 @@ def build_app(async_engine: AsyncEngine, tokenizer: Any, model_name: str, defaul
                 if chat
                 else {"index": 0, "text": text, "logprobs": None, "finish_reason": reason}
             )
-            return {"id": rid, "object": obj, "created": created, "model": model_name, "choices": [choice], "usage": _usage(len(prompt_ids), n_out)}
+            return {"id": rid, "object": obj, "created": created, "model": model_name, "choices": [choice],
+                    "usage": _usage(len(prompt_ids), n_out, cached)}
 
         chunk_obj = "chat.completion.chunk" if chat else "text_completion"
 
         async def stream():
-            n_out = 0
+            n_out, cached = 0, None
             if chat:
                 yield _sse({"id": rid, "object": chunk_obj, "created": created, "model": model_name,
                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
             try:
                 async for out in async_engine.generate(prompt_ids, params, rid):
                     n_out = out.num_output_tokens
+                    cached = out.metrics.get("cached_tokens", cached)
                     if not out.delta_text and not out.finished:
                         continue
                     if chat:
@@ -175,7 +182,8 @@ def build_app(async_engine: AsyncEngine, tokenizer: Any, model_name: str, defaul
             except ValueError as exc:
                 yield _sse({"error": {"message": str(exc)}})
             if body.include_usage:
-                yield _sse({"id": rid, "object": chunk_obj, "created": created, "model": model_name, "choices": [], "usage": _usage(len(prompt_ids), n_out)})
+                yield _sse({"id": rid, "object": chunk_obj, "created": created, "model": model_name, "choices": [],
+                            "usage": _usage(len(prompt_ids), n_out, cached)})
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream(), media_type="text/event-stream")

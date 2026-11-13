@@ -41,7 +41,7 @@ def kv_bytes_per_token(model_dir: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--engine", choices=["vllm", "sglang"], required=True)
+    ap.add_argument("--engine", choices=["vllm", "sglang", "tandem"], required=True)
     ap.add_argument("--python", required=True)
     ap.add_argument("--client-python", default=sys.executable)
     ap.add_argument("--model", required=True)
@@ -73,12 +73,17 @@ def main() -> None:
     a.mem = a.mem if a.mem is not None else (0.85 if a.engine == "sglang" else 0.90)
     a.prefix_cache, a.kv_cache_gb = True, 0.0
 
-    pin = (f"--kv-cache-memory-bytes {a.kv_tokens * kv_bytes_per_token(a.model)}" if a.engine == "vllm"
-           else f"--max-total-tokens {a.kv_tokens}")
+    if a.engine == "tandem":  # --kv-cache-gb is GiB; a hair more than the exact size so that it floors to kv_tokens
+        pin = ""
+        a.kv_cache_gb = round((a.kv_tokens * kv_bytes_per_token(a.model) + 4096) / 2**30, 6)
+    else:
+        pin = (f"--kv-cache-memory-bytes {a.kv_tokens * kv_bytes_per_token(a.model)}" if a.engine == "vllm"
+               else f"--max-total-tokens {a.kv_tokens}")
     tier = ""
-    if a.host_gb:  # same bytes for both: vLLM takes GiB, SGLang GB (10^9)
-        tier = (f"--kv-offloading-size {a.host_gb * 1e9 / 2**30:.2f} --kv-offloading-backend native"
-                if a.engine == "vllm" else f"--enable-hierarchical-cache --hicache-size {a.host_gb:g}")
+    if a.host_gb:  # same bytes for all: vLLM takes GiB, SGLang and tandem GB (10^9)
+        tier = {"vllm": f"--kv-offloading-size {a.host_gb * 1e9 / 2**30:.2f} --kv-offloading-backend native",
+                "sglang": f"--enable-hierarchical-cache --hicache-size {a.host_gb:g}",
+                "tandem": f"--host-kv-gb {a.host_gb:g}"}[a.engine]
     a.extra_args = " ".join(x for x in (a.extra_args, pin, tier) if x)
 
     env_meta = run_matrix.environment(a)

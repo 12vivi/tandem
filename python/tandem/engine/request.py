@@ -62,6 +62,7 @@ class Request:
         self.block_ids: list[int] = []
         self.prefix_node: Optional["RadixNode"] = None
         self.num_cached_tokens = 0  # prefix-cache hit at the last admission
+        self.rematch = False  # back from a host -> GPU load: its next prefix lookup is not a new query
 
         # speculative decoding
         self.spec_token_ids: list[int] = []
