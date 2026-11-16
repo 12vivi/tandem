@@ -556,3 +556,36 @@ def test_late_bound_schedule_takes_arrivals_into_next_step(tiny_path, tiny_fp32,
     assert added["rid"] in [s.request.request_id for s in next_step.scheduled]
     for p, a, rid in zip(ps + [late], ref, rids + [added["rid"]]):
         assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, outs[rid].output_token_ids, tol=0.3)
+
+
+def test_late_bound_schedule_during_long_prefill(tiny_path, monkeypatch):
+    """While a chunk of a long prompt is prefilled, the next step is scheduled late too: a request
+    whose prompt is cached (so a short prefill) arriving meanwhile is in the very next step, of its
+    own, ahead of the long prompt's next chunk. Prefill steps are made to take 1 ms per token."""
+    from tandem.executor.model_runner import InFlightStep
+
+    monkeypatch.setattr(InFlightStep, "gpu_seconds",
+                        lambda self: 0.02 if self.decode_only else 0.001 * self.sched.num_tokens)
+    eng = make(tiny_path, max_num_batched_tokens=128)
+    eng.jit_prefill_tokens = 64
+    warm = prompts(31, [48], vocab=VOCAB)[0]
+    eng.generate([warm], GREEDY)
+    long = prompts(32, [600], vocab=VOCAB)[0]
+    added = {}
+
+    def input_wait(deadline):
+        running = eng.inflight
+        if "rid" not in added and running is not None and not running.decode_only:
+            added["rid"] = eng.add_request(warm + [3, 4], GREEDY)
+
+    eng.input_wait = input_wait
+    long_id = eng.add_request(long, GREEDY)
+    next_step = None
+    while eng.has_unfinished_requests():
+        before = "rid" in added
+        eng.step()
+        if not before and "rid" in added:
+            next_step = eng.inflight.sched
+    assert eng.prefill_tok_est == pytest.approx(0.001)
+    assert [s.request.request_id for s in next_step.scheduled] == [added["rid"]]  # long's chunk waits
+    assert long_id not in [s.request.request_id for s in next_step.scheduled]

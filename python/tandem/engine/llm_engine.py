@@ -138,19 +138,23 @@ class LLMEngine:
         # drafts depend on the latest tokens, so speculative decoding keeps the synchronous loop
         self.overlap = config.overlap_schedule and self.proposer is None
         self.inflight = None  # launched step whose tokens are not processed yet (overlap)
-        # Late-bound scheduling (overlap only; set by the engine-core process): while a decode step
-        # runs, step N+1 is scheduled only shortly before it ends, and requests arriving meanwhile
-        # are taken in through ``input_wait(deadline)``, which returns at the first arrival: the next
-        # step is then a prefill step, whose eager launch takes longer than a graph replay, so it is
-        # launched right away. Otherwise a request that arrives while step N runs waits for step
-        # N+1 too, one whole decode step more of TTFT. No wait when requests are queued already.
-        # ``decode_est`` is an EMA of the GPU time of decode steps (CUDA events, not wall time: a
-        # late launch must not lengthen the estimate); the margin covers scheduling and launching
-        # N+1.
+        # Late-bound scheduling (overlap only; set by the engine-core process): while a decode step,
+        # or a prefill step of at least jit_prefill_tokens, runs, step N+1 is scheduled only
+        # shortly before it ends, and requests arriving meanwhile are taken in through
+        # ``input_wait(deadline)``, which returns at the first arrival: the next step is then a
+        # prefill step, whose eager launch takes longer than a graph replay, so it is launched right
+        # away. Otherwise a request that arrives while step N runs waits for step N+1 too: one decode
+        # step more of TTFT, or one more 2048-token chunk (~0.5 s for an 8B model) when a long prompt
+        # is being prefilled. No wait when requests are queued already. The estimates come from the
+        # GPU time of past steps (CUDA events, not wall time: a late launch must not lengthen them):
+        # an EMA for decode steps, an EMA per token for prefill steps (without host -> GPU loads,
+        # which can make a step wait); the margin covers scheduling and launching N+1.
         self.input_wait = None
         self.decode_est = 0.0
+        self.prefill_tok_est = 0.0
         self.host_launch_est = 0.0
         self.jit_min_step = 0.010  # shorter steps (small models) are scheduled at once
+        self.jit_prefill_tokens = 512
         self.jit_margin_floor = 0.002
         self._last_resolve = 0.0
 
@@ -286,11 +290,10 @@ class LLMEngine:
     def _step_overlap(self) -> list[RequestOutput]:
         """Launch step N, then finish step N-1 on the host while the GPU runs step N: its
         tokens become N's inputs on the device, so the host never waits before launching."""
-        running = self.inflight
-        if (self.input_wait is not None and running is not None and running.decode_only
-                and self.decode_est >= self.jit_min_step and not self.scheduler.waiting):
-            margin = max(0.25 * self.decode_est, 2 * self.host_launch_est, self.jit_margin_floor)
-            deadline = self._last_resolve + self.decode_est - margin  # the running step began then
+        est = self._running_estimate()
+        if self.input_wait is not None and est >= self.jit_min_step and not self.scheduler.waiting:
+            margin = max(0.25 * est, 2 * self.host_launch_est, self.jit_margin_floor)
+            deadline = self._last_resolve + est - margin  # the running step began then
             if time.perf_counter() < deadline:
                 self.input_wait(deadline)
         TIMER.start()
@@ -315,10 +318,14 @@ class LLMEngine:
             return []
         sampled = prev.resolve()
         self._last_resolve = time.perf_counter()
-        if prev.decode_only:
-            gpu = prev.gpu_seconds()
-            if gpu is not None:
+        gpu = prev.gpu_seconds()
+        if gpu is not None:
+            n = prev.sched.num_tokens
+            if prev.decode_only:
                 self.decode_est = gpu if self.decode_est == 0 else 0.7 * self.decode_est + 0.3 * gpu
+            elif n >= self.jit_prefill_tokens and not prev.sched.load_handles:
+                per = gpu / n
+                self.prefill_tok_est = per if self.prefill_tok_est == 0 else 0.7 * self.prefill_tok_est + 0.3 * per
         TIMER.mark("wait_gpu")
         updated = self.scheduler.update_resolved(prev.sched, sampled)
         TIMER.mark("update")
@@ -326,6 +333,16 @@ class LLMEngine:
         TIMER.mark("emit")
         TIMER.end_step()
         return outputs
+
+    def _running_estimate(self) -> float:
+        """Expected GPU time of the step in flight (0: unknown, schedule at once)."""
+        running = self.inflight
+        if running is None:
+            return 0.0
+        if running.decode_only:
+            return self.decode_est
+        n = running.sched.num_tokens
+        return n * self.prefill_tok_est if n >= self.jit_prefill_tokens else 0.0
 
     def _emit(self, updated: list[Request]) -> list[RequestOutput]:
         outputs = []
