@@ -1,4 +1,4 @@
-// W4A16 decode kernels (design doc P2 / A2): y[M, N] = x[M, K] @ dequant(W)[N, K]^T for M <= 16.
+// W4A16 kernels (design doc P2 / A2): y[M, N] = x[M, K] @ dequant(W)[N, K]^T.
 //
 // Weight layout (tandem/layers/awq.py pack_rows): packed int32 [N][K/128][4 j][4 cc]. For output
 // row n and quant group G (128 k), int32 (j, cc) holds the 8 consecutive weights
@@ -22,11 +22,20 @@
 //            computes NT x 16 output rows; its WARPS_K warps split K by quant groups (UNROLL groups
 //            in flight per lane) and add up their partial sums in shared memory. For gate_up it
 //            can also apply SwiGLU in its epilogue (act = 1, see w4_mma_kernel).
+//   w4_gemm  M > 16 (prefill, decode batches over 16), tensor cores: x is the A operand (16 tokens
+//            per MMA), the weights are dequantized in registers into B fragments with the same k
+//            permutation, x and weight tiles go through a cp.async ring in shared memory, optional
+//            split-K across CTAs, and the same SwiGLU epilogue (see w4_gemm_kernel). Replaces
+//            "dequantize to float16 + cuBLAS", which wrote and re-read the whole float16 weights.
+
+#include <algorithm>
 
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 
 namespace {
 
@@ -285,6 +294,277 @@ __global__ void __launch_bounds__(WARPS_K * 32) w4_mma_kernel(
     }
 }
 
+// ---------------------------------------------------------------- tensor cores, M > 16 (prefill)
+__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))), "l"(src));
+}
+// An opaque copy: the compiler cannot recompute v from its inputs (rematerialization), so values
+// computed once before a loop stay in registers instead of being recomputed every iteration
+__device__ __forceinline__ int opaque(int v) {
+    asm volatile("" : "+r"(v));
+    return v;
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+// x is the A operand here (16 tokens per MMA) and the weights the B operand (8 output rows), with
+// w4_mma's k permutation: lane (g, c) feeds the 8 consecutive k of int32 (c, cc) to both, so
+// logical k 2c, 2c+1 / 2c+8, 2c+9 of step s are physical 32 cc + 8c + 4s + {0, 1} / {2, 3}.
+// A CTA computes BM = 16 MT tokens x BN = WARPS_N x 8 NT output rows; warp (wn, wk) takes rows
+// wn x 8 NT .. + 8 NT - 1 of every token and quant groups wk, wk + WARPS_K, ... (partial sums added
+// in shared memory at the end). The x and weight tiles of WARPS_K quant groups per step go through
+// a STAGES-deep cp.async ring in shared memory; x rows are XOR swizzled so that the 16-byte
+// fragment loads of rows g and g + 1 use different banks. Fragments of lane (g, c):
+//   A (x, 16 x 16): token rows 16 i + g (a0, a2) and + 8 (a1, a3): one 16-byte load each per cc
+//   B (weights, 16 x 8): row 8 t + g, dequantized from its 16 bytes (j = c, cc = 0..3) per group
+//   D: d0, d1 = token 16 i + g, output rows 8 t + 2c, 8 t + 2c + 1; d2, d3 = token 16 i + g + 8
+// act = 1 (gate_up, rows in interleave_gate_up order): row tiles 2T and 2T + 1 are the gate and up
+// rows of features 8T .. 8T + 7, so a lane holds gate and up of features 8T + 2c, 8T + 2c + 1 and
+// writes y[M, N/2] = silu(gate) * up from the float32 accumulators.
+// Split-K: CTAs 0 .. dp_tiles - 1 take whole tiles; every later tile is shared by `splits` CTAs,
+// each taking a range of quant groups (dp_tiles = 0: all tiles split, for small M; dp_tiles = the
+// full waves: only the last, partial wave is split so that it fills the GPU too, see gemm_launch).
+// Each warp of a split stores its float32 partial sums to ws (fragment order, coalesced) and bumps
+// its counter in locks; the warp that arrives last adds the others' sums (ld.global.cg: L2, never
+// a stale L1 line from an earlier call), writes y and resets the counter for the next call.
+template <int MT, int NT, int WARPS_N, int WARPS_K, int STAGES>
+__global__ void __launch_bounds__(WARPS_N * WARPS_K * 32) w4_gemm_kernel(
+    const half* __restrict__ x, const uint4* __restrict__ w, const half* __restrict__ scales,
+    const half* __restrict__ zeros, half* __restrict__ y, float* __restrict__ ws, int* __restrict__ locks,
+    int M, int N, int K, int dp_tiles, int splits, int act) {
+    static_assert(NT % 2 == 0, "the SwiGLU epilogue pairs row tiles");
+    constexpr int BM = 16 * MT, WN = 8 * NT, BN = WARPS_N * WN, THREADS = WARPS_N * WARPS_K * 32;
+    constexpr int XC = BM * 16, WC = BN * 4, GC = XC + WC;  // 16-byte chunks per quant group: x, weights
+    extern __shared__ uint4 smem[];  // ring: STAGES steps x WARPS_K quant groups x GC chunks
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int wn = warp % WARPS_N, wk = warp / WARPS_N;
+    const int g = lane >> 2, c = lane & 3;
+    const int groups = K >> 7, steps = (groups + WARPS_K - 1) / WARPS_K;
+    const bool whole = static_cast<int>(blockIdx.x) < dp_tiles;
+    const int sk = blockIdx.x - dp_tiles;  // index among the split CTAs
+    const int nsplit = whole ? 1 : splits;
+    const int tile = whole ? blockIdx.x : dp_tiles + sk / splits, split = whole ? 0 : sk % splits;
+    const int step0 = split * steps / nsplit, nsteps = (split + 1) * steps / nsplit - step0;
+    // tile order: bands of 8 row blocks, row block fastest, so up to 8 CTAs read a weight tile at
+    // about the same time (one DRAM read, then L2 hits) and the band's x stays in L2
+    const int mb = (M + BM - 1) / BM, nb = (N + BN - 1) / BN;
+    const int band = tile / (8 * nb), band_rows = min(mb - band * 8, 8), r_in = tile - band * 8 * nb;
+    const int m0 = (band * 8 + r_in % band_rows) * BM, n0 = (r_in / band_rows) * BN;
+
+    // this thread's cp.async sources, as 32-bit offsets of quant group 0 (computed once; rows past
+    // M / N load the last row: computed, never stored). x chunk i = it * THREADS + tid is row
+    // i / 16, chunk i % 16; THREADS / 16 is even, so the row parity (the swizzle) is fixed per thread.
+    constexpr int XIT = (XC + THREADS - 1) / THREADS, WIT = (WC + THREADS - 1) / THREADS;
+    int xsrc[XIT], wsrc[WIT];
+#pragma unroll
+    for (int it = 0; it < XIT; ++it) {
+        const int i = it * THREADS + threadIdx.x;
+        xsrc[it] = opaque(min(m0 + (i >> 4), M - 1) * K + ((i & 15) << 3));
+    }
+#pragma unroll
+    for (int it = 0; it < WIT; ++it) {
+        const int i = it * THREADS + threadIdx.x;
+        wsrc[it] = opaque(min(n0 + (i >> 2), N - 1) * groups * 4 + (i & 3));
+    }
+    const int xdst = opaque(((threadIdx.x >> 4) << 4) + ((threadIdx.x & 15) ^ (((threadIdx.x >> 4) & 1) << 2)));
+    auto load = [&](int ls) {
+        const int step = step0 + ls;
+        uint4* st = smem + (ls % STAGES) * (WARPS_K * GC);
+#pragma unroll
+        for (int u = 0; u < WARPS_K; ++u) {
+            const int G = step * WARPS_K + u;
+            if (G >= groups) break;
+            uint4* sx = st + u * GC;
+#pragma unroll
+            for (int it = 0; it < XIT; ++it)
+                if (XC % THREADS == 0 || it * THREADS + threadIdx.x < XC)
+                    cp_async16(sx + xdst + it * THREADS, x + (xsrc[it] + (G << 7)));
+#pragma unroll
+            for (int it = 0; it < WIT; ++it)
+                if (WC % THREADS == 0 || it * THREADS + threadIdx.x < WC)
+                    cp_async16(sx + XC + it * THREADS + threadIdx.x, w + (wsrc[it] + (G << 2)));
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < nsteps) load(s);
+        cp_async_commit();
+    }
+    int prow[NT];  // this lane's weight rows, for the group parameters
+#pragma unroll
+    for (int t = 0; t < NT; ++t) prow[t] = opaque(min(n0 + wn * WN + 8 * t + g, N - 1) * groups);
+    const int swz = (g & 1) << 2;  // token rows 16 i + 8 h + g: (row & 1) == (g & 1)
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][t][e] = 0.0f;
+
+    for (int ls = 0; ls < nsteps; ++ls) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();  // this step's tiles are visible, and every warp is done with the slot the next load refills
+        if (ls + STAGES - 1 < nsteps) load(ls + STAGES - 1);
+        cp_async_commit();
+        const int G = (step0 + ls) * WARPS_K + wk;
+        if (G >= groups) continue;
+        GroupParams gp[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) gp[t] = group_params(scales, zeros, prow[t] + G);
+        const uint4* sx = smem + (ls % STAGES) * (WARPS_K * GC) + wk * GC;
+        uint4 wv[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) wv[t] = sx[XC + (wn * WN + 8 * t + g) * 4 + c];
+#pragma unroll
+        for (int cc = 0; cc < 4; ++cc) {
+            uint4 xa[MT][2];  // x at k = 128 G + 32 cc + 8 c .. + 7 of token rows 16 i + g (+ 8)
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) xa[i][h] = sx[((16 * i + 8 * h + g) << 4) + ((4 * cc + c) ^ swz)];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                half2 hb[4];
+                dequant_group8(word(wv[t], cc), gp[t], hb);
+#pragma unroll
+                for (int s = 0; s < 2; ++s)  // k16 step s: physical k 8c + 4s .. 8c + 4s + 3 of this cc
+#pragma unroll
+                    for (int i = 0; i < MT; ++i)
+                        mma16816(acc[i][t], word(xa[i][0], 2 * s), word(xa[i][1], 2 * s), word(xa[i][0], 2 * s + 1),
+                                 word(xa[i][1], 2 * s + 1), h2u(hb[2 * s]), h2u(hb[2 * s + 1]));
+            }
+        }
+    }
+    if constexpr (WARPS_K > 1) {  // add up the K slices of warps wk > 0 in warp wk = 0
+        constexpr int V = MT * NT * 4;
+        cp_async_wait<0>();
+        __syncthreads();  // the ring is free
+        float* red = reinterpret_cast<float*>(smem);  // [WARPS_K - 1][WARPS_N][V][32]
+        if (wk > 0) {
+            float* dst = red + ((wk - 1) * WARPS_N + wn) * V * 32 + lane;
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) dst[((i * NT + t) * 4 + e) * 32] = acc[i][t][e];
+        }
+        __syncthreads();
+        if (wk > 0) return;
+#pragma unroll
+        for (int v = 1; v < WARPS_K; ++v) {
+            const float* src = red + ((v - 1) * WARPS_N + wn) * V * 32 + lane;
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[i][t][e] += src[((i * NT + t) * 4 + e) * 32];
+        }
+    }
+    if (nsplit > 1) {  // warps wk = 0 only from here on
+        constexpr int V = MT * NT * 4;
+        const int st = tile - dp_tiles;  // index among the split tiles
+        float* mine = ws + (static_cast<size_t>(sk) * WARPS_N + wn) * V * 32 + lane;
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int t = 0; t < NT; ++t)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) mine[((i * NT + t) * 4 + e) * 32] = acc[i][t][e];
+        __threadfence();
+        __syncwarp();
+        int last = 0;
+        if (lane == 0) last = atomicAdd(locks + st * WARPS_N + wn, 1) == splits - 1;
+        if (!__shfl_sync(0xffffffffu, last, 0)) return;
+        __threadfence();
+        for (int v = 0; v < splits; ++v) {
+            if (v == split) continue;
+            const float* other = ws + ((static_cast<size_t>(st) * splits + v) * WARPS_N + wn) * V * 32 + lane;
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[i][t][e] += __ldcg(other + ((i * NT + t) * 4 + e) * 32);
+        }
+        if (lane == 0) locks[st * WARPS_N + wn] = 0;  // ready for the next call
+    }
+    const int nw = n0 + wn * WN;
+    if (act) {  // N % 16 == 0 (checked on the host)
+        const int half_n = N >> 1;
+#pragma unroll
+        for (int t = 0; t < NT; t += 2) {
+            const int f = ((nw + 8 * t) >> 1) + 2 * c;  // gate in row tile t, up in t + 1
+            if (f >= half_n) continue;
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int m = m0 + 16 * i + 8 * h + g;
+                    if (m < M)
+                        *reinterpret_cast<half2*>(y + static_cast<size_t>(m) * half_n + f) = __floats2half2_rn(
+                            silu(acc[i][t][2 * h]) * acc[i][t + 1][2 * h],
+                            silu(acc[i][t][2 * h + 1]) * acc[i][t + 1][2 * h + 1]);
+                }
+        }
+        return;
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const int n = nw + 8 * t + 2 * c;  // N % 8 == 0: n < N implies n + 1 < N
+        if (n >= N) continue;
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int m = m0 + 16 * i + 8 * h + g;
+                if (m < M)
+                    *reinterpret_cast<half2*>(y + static_cast<size_t>(m) * N + n) =
+                        __floats2half2_rn(acc[i][t][2 * h], acc[i][t][2 * h + 1]);
+            }
+    }
+}
+
+template <int MT, int NT, int WN, int WK, int ST>
+void gemm_launch(const half* xp, const uint4* wp, const half* sp, const half* zp, half* yp, torch::Tensor& ws,
+                 torch::Tensor& locks, int m, int n, int k, int splits, int act, cudaStream_t stream) {
+    constexpr int BM = 16 * MT, BN = WN * 8 * NT;
+    constexpr int ring = ST * WK * (BM * 16 + BN * 4) * 16, red = (WK - 1) * WN * MT * NT * 4 * 32 * 4;
+    constexpr int bytes = ring > red ? ring : red;
+    auto kern = w4_gemm_kernel<MT, NT, WN, WK, ST>;
+    static int per_sm = 0;  // resident CTAs per SM; set before the first launch (outside graph capture)
+    if (per_sm == 0) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kern, WN * WK * 32, bytes));
+        per_sm = per_sm > 0 ? per_sm : 1;
+    }
+    const int tiles = ((m + BM - 1) / BM) * ((n + BN - 1) / BN), steps = (k / 128 + WK - 1) / WK;
+    const int64_t room = std::min<int64_t>(ws.numel() / (BM * BN), locks.numel() / WN);  // split tiles x splits
+    int dp = tiles, s = 1;
+    if (splits == 0) {  // whole tiles for the full waves; split the last, partial wave along K
+        const int slots = per_sm * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        const int rem = tiles % slots;
+        double best = 1.0;  // s = 1: the partial wave of whole tiles, in units of one tile's time
+        for (int c = 2; c <= 8 && c <= steps && rem > 0; ++c) {
+            if (static_cast<int64_t>(rem) * c > room) break;
+            const double t = static_cast<double>((rem * c + slots - 1) / slots) / c + 0.01 * c;  // + fix-up cost
+            if (t < best) best = t, s = c;
+        }
+        if (s > 1) dp = tiles - rem;
+    } else if (splits > 1) {
+        TORCH_CHECK(static_cast<int64_t>(tiles) * splits <= room, "w4_gemm: split-K workspace too small for ",
+                    tiles, " tiles x ", splits, " splits");
+        dp = 0, s = splits;
+    }
+    kern<<<dp + (tiles - dp) * s, WN * WK * 32, bytes, stream>>>(xp, wp, sp, zp, yp, ws.data_ptr<float>(),
+                                                                 locks.data_ptr<int32_t>(), m, n, k, dp, s, act);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void check(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& s, const torch::Tensor& z) {
     TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.scalar_type() == at::kHalf && x.is_contiguous(),
                 "x: contiguous 2-D float16 CUDA tensor");
@@ -365,4 +645,39 @@ torch::Tensor w4_mma(torch::Tensor x, torch::Tensor w, torch::Tensor s, torch::T
     TANDEM_MMA_CASE(8, 2, 2)
 #undef TANDEM_MMA_CASE
     TORCH_CHECK(false, "w4_mma: unsupported warps_k / unroll / ntile ", warps_k, " / ", unroll, " / ", ntile);
+}
+
+torch::Tensor w4_gemm(torch::Tensor x, torch::Tensor w, torch::Tensor s, torch::Tensor z, torch::Tensor ws,
+                      torch::Tensor locks, int64_t mt, int64_t nt, int64_t warps_n, int64_t warps_k, int64_t stages,
+                      int64_t splits, int64_t act) {
+    check(x, w, s, z);
+    TORCH_CHECK(ws.is_cuda() && ws.scalar_type() == at::kFloat && locks.is_cuda() && locks.scalar_type() == at::kInt,
+                "w4_gemm: float32 workspace and int32 locks (zero) on the GPU");
+    TORCH_CHECK(splits >= 0 && splits <= 16, "w4_gemm: splits 0 (split the last wave) or 1 .. 16");
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    const int m = x.size(0), n = w.size(0), k = x.size(1);
+    TORCH_CHECK(n % 8 == 0, "w4_gemm: N % 8 == 0");
+    TORCH_CHECK(act == 0 || (act == 1 && n % 16 == 0), "w4_gemm: act 0, or 1 (SwiGLU) with N % 16 == 0");
+    TORCH_CHECK(static_cast<int64_t>(m) * k < (int64_t{1} << 31), "w4_gemm: M x K < 2^31 (32-bit offsets)");
+    auto y = torch::empty({m, act ? n / 2 : n}, x.options());
+    if (m == 0) return y;
+    const int a = static_cast<int>(act);
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    const auto* xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+    const auto* wp = reinterpret_cast<const uint4*>(w.data_ptr<int32_t>());
+    const auto* sp = reinterpret_cast<const half*>(s.data_ptr<at::Half>());
+    const auto* zp = reinterpret_cast<const half*>(z.data_ptr<at::Half>());
+    auto* yp = reinterpret_cast<half*>(y.data_ptr<at::Half>());
+#define TANDEM_GEMM_CASE(MT, NT, WN, WK, ST)                                                     \
+    if (mt == MT && nt == NT && warps_n == WN && warps_k == WK && stages == ST) {               \
+        gemm_launch<MT, NT, WN, WK, ST>(xp, wp, sp, zp, yp, ws, locks, m, n, k, splits, a, stream); \
+        return y;                                                                                \
+    }
+    TANDEM_GEMM_CASE(4, 4, 8, 1, 3) TANDEM_GEMM_CASE(4, 4, 4, 1, 4) TANDEM_GEMM_CASE(4, 4, 4, 1, 2)
+    TANDEM_GEMM_CASE(4, 4, 4, 2, 2) TANDEM_GEMM_CASE(4, 2, 8, 1, 3)
+    TANDEM_GEMM_CASE(2, 4, 8, 1, 4) TANDEM_GEMM_CASE(2, 4, 4, 2, 3) TANDEM_GEMM_CASE(2, 4, 4, 1, 3)
+    TANDEM_GEMM_CASE(2, 2, 4, 2, 4) TANDEM_GEMM_CASE(2, 2, 8, 1, 4)
+#undef TANDEM_GEMM_CASE
+    TORCH_CHECK(false, "w4_gemm: unsupported mt / nt / warps_n / warps_k / stages ", mt, " / ", nt, " / ", warps_n,
+                " / ", warps_k, " / ", stages);
 }

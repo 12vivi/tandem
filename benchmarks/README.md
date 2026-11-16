@@ -115,6 +115,7 @@ tandem 另有两个诊断开关，默认关闭，通过 `--env` 传给服务：
 - `bench_gemv.py`：BF16 小 batch GEMV（Triton）各配置 vs cuBLAS，结果填 `tandem/layers/triton_gemv.py` 的配置表；`bench_gemv_fused.py` 是融合 norm / 激活的变体。
 - `bench_decode_attn.py`：FlashInfer decode attention 的几种调用方式和 Triton split-KV（`--triton`），`--heads 32,8,128 --dtype float16` 测 8B 形状。
 - `bench_w4.py`：W4A16 内核（CUDA 核心 `w4_gemv`、tensor core `w4_mma`）在 8B AWQ 各投影上的最优配置，结果填 `tandem/layers/awq.py` 的 `W4_KERNELS`；`--act` 另测 gate_up 融合 SwiGLU 收尾的版本。第一次运行会编译 CUDA 扩展，要设 `CUDA_HOME` 并把 nvcc 和 gcc 11 放进 PATH（同 `--env` 的设置）。
+- `bench_w4_gemm.py`：M > 16（prefill、batch 超过 16 的 decode）的 W4A16 GEMM：融合反量化的 `w4_gemm`（各分块配置 × split-K）对比"反量化成 FP16 + cuBLAS"和只算 cuBLAS，并逐配置核对结果；结果填 `tandem/layers/awq.py` 的 `W4_GEMM_KERNELS`。
 - `bench_norm.py`：残差加 RMSNorm，FlashInfer 与 Triton（`tandem/layers/triton_ops.py`）在 decode batch 下的对比，并检查两者结果一致。
 - `bench_gemv.py --models 8b --projs lm_head --dtype float16`：8B 的 lm_head（AWQ 模型的 FP16 头）。
 

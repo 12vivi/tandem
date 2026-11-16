@@ -1,4 +1,5 @@
-"""AWQ W4A16 (tandem.layers.awq): repack from the AutoAWQ "gemm" layout, dequantize, decode kernels.
+"""AWQ W4A16 (tandem.layers.awq): repack from the AutoAWQ "gemm" layout, dequantize, decode kernels,
+the M > 16 GEMM.
 
 The AWQ packer below follows AutoAWQ's convention (nibble i of an int32 holds output column
 ORDER[i] of its group of 8); the real-checkpoint check is in tests/test_real_model.py-style runs
@@ -87,21 +88,28 @@ def test_w4linear_small_and_large_batch():
     k, n = 512, 256
     layer, w_ref = _layer(k, n, seed=2)
     assert not layer.awq_layout and not hasattr(layer, "qweight") and layer.packed.shape == (n, k // 8)
-    for m in (1, 3, 8, 12, 16, 37):  # CUDA kernels for m <= 16, dequantize + cuBLAS above
+    for m in (1, 3, 8, 12, 16, 37, 300):  # decode kernels for m <= 16, the GEMM above
         x = torch.randn(m, k, device="cuda", dtype=torch.float16)
         y = layer(x).float()
         assert torch.allclose(y, x.float() @ w_ref.t(), atol=0.05, rtol=0.02), m
     x = torch.empty(3 * k + 1, device="cuda", dtype=torch.float16)[1:].view(3, k).normal_()  # not 16-byte aligned
     assert torch.allclose(layer(x).float(), x.float() @ w_ref.t(), atol=0.05, rtol=0.02)
+    x = torch.empty(40 * k + 1, device="cuda", dtype=torch.float16)[1:].view(40, k).normal_()
+    assert torch.allclose(layer(x).float(), x.float() @ w_ref.t(), atol=0.05, rtol=0.02)  # dequantize + cuBLAS
+    # table entries: a GEMM config (with split-K), or None = dequantize + cuBLAS
+    for cfg in ((2, 4, 4, 2, 3, 2), (4, 4, 4, 1, 2, 0), None):
+        layer.gemm_kernels = {(n, k): ((1 << 30, cfg),)}
+        x = torch.randn(50, k, device="cuda", dtype=torch.float16)
+        assert torch.allclose(layer(x).float(), x.float() @ w_ref.t(), atol=0.05, rtol=0.02), cfg
 
 
 def test_w4linear_silu_mul():
-    """gate_up with SwiGLU: rows interleaved at finalize, epilogue at decode (m <= 16), dequantize +
-    cuBLAS + de-interleave for prefill and for unaligned inputs."""
+    """gate_up with SwiGLU: rows interleaved at finalize, epilogue in the decode kernels (m <= 16)
+    and the GEMM (m > 16); dequantize + cuBLAS + de-interleave for unaligned inputs."""
     k, n = 512, 384
     layer, w_ref = _layer(k, n, seed=5, silu_mul=True)
     assert not W4Linear(k, n + 8, 128).enable_silu_mul()  # N % 16 != 0: not fusable
-    for m in (1, 3, 8, 12, 16, 37):
+    for m in (1, 3, 8, 12, 16, 37, 300):
         x = torch.randn(m, k, device="cuda", dtype=torch.float16)
         y = layer(x).float()
         assert y.shape == (m, n // 2)
@@ -219,6 +227,76 @@ def test_cuda_w4_mma_matches_dequantized():
             for cfg in MMA_CONFIGS:
                 y = ext.w4_mma(x, packed, s, z, *cfg, 0).float()
                 assert torch.allclose(y, ref, atol=0.02, rtol=0.01), (k, n, m, cfg, (y - ref).abs().max())
+
+
+GEMM_CONFIGS = ((4, 4, 8, 1, 3), (4, 4, 4, 1, 4), (4, 4, 4, 1, 2), (4, 4, 4, 2, 2), (4, 2, 8, 1, 3),
+                (2, 4, 8, 1, 4), (2, 4, 4, 2, 3), (2, 4, 4, 1, 3), (2, 2, 4, 2, 4),
+                (2, 2, 8, 1, 4))  # (MT, NT, WARPS_N, WARPS_K, STAGES)
+
+
+def _workspace():
+    from tandem.layers import w4_cuda
+
+    return w4_cuda.workspace("cuda")
+
+
+def test_cuda_w4_gemm_matches_dequantized():
+    """M > 16 GEMM (x through the cp.async ring, weights dequantized in registers) against the
+    dequantized matmul: every compiled config, partial row and column tiles, split-K of every tile
+    or of the last wave only (each call leaves its counters at zero for the next one)."""
+    ext = _ext()
+    buf, locks = _workspace()
+    for k, n in SHAPES:
+        qweight, qzeros, scales, w_ref = random_awq(k, n, seed=7)
+        packed, s, z = repack_awq(qweight, qzeros, scales, 128)
+        for m in (17, 40, 64, 130):
+            x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+            ref = x.float() @ w_ref.t()
+            for cfg in GEMM_CONFIGS:
+                for splits in (0, 1, 3):  # 0: split only the last, partial wave of tiles
+                    y = ext.w4_gemm(x, packed, s, z, buf, locks, *cfg, splits, 0).float()
+                    assert torch.allclose(y, ref, atol=0.02, rtol=0.01), (k, n, m, cfg, splits, (y - ref).abs().max())
+    assert int(locks.abs().sum()) == 0
+
+
+def test_cuda_w4_gemm_silu_mul():
+    """The GEMM's SwiGLU epilogue (act = 1, rows interleaved): y = silu(gate) * up, [M, N / 2]."""
+    ext = _ext()
+    buf, locks = _workspace()
+    for k, n in ((128, 32), (1024, 512), (4096, 1024)):
+        qweight, qzeros, scales, w_ref = random_awq(k, n, seed=8)
+        packed, s, z = (interleave_gate_up(t) for t in repack_awq(qweight, qzeros, scales, 128))
+        for m in (17, 64, 100):
+            x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+            ref = _swiglu_ref(x, w_ref)
+            for cfg in GEMM_CONFIGS:
+                for splits in (0, 1, 2):
+                    y = ext.w4_gemm(x, packed, s, z, buf, locks, *cfg, splits, 1).float()
+                    assert y.shape == (m, n // 2)
+                    assert torch.allclose(y, ref, atol=0.02, rtol=0.01), (k, n, m, cfg, splits, (y - ref).abs().max())
+
+
+def test_cuda_w4_gemm_split_k_graph_replay():
+    """Split-K inside a CUDA graph: the counters are reset by the kernel, so replays stay correct."""
+    ext = _ext()
+    buf, locks = _workspace()
+    k, n = 1024, 512
+    qweight, qzeros, scales, w_ref = random_awq(k, n, seed=9)
+    packed, s, z = repack_awq(qweight, qzeros, scales, 128)
+    x = torch.randn(33, k, device="cuda", dtype=torch.float16)
+    cfg = (2, 4, 4, 2, 3, 4, 0)
+    ext.w4_gemm(x, packed, s, z, buf, locks, *cfg)  # first launch (kernel attributes) outside capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = ext.w4_gemm(x, packed, s, z, buf, locks, *cfg)
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = x.float() @ w_ref.t()
+        assert torch.allclose(y.float(), ref, atol=0.02, rtol=0.01), (y.float() - ref).abs().max()
+    assert int(locks.abs().sum()) == 0
 
 
 def test_cuda_w4_mma_silu_mul():

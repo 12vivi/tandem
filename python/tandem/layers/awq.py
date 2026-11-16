@@ -19,12 +19,15 @@ group of one row, and the 4 lanes j = 0..3 hold 32 consecutive k for each cc: fo
 kernel that is the A-fragment layout of mma.m16n8k16 up to a k permutation that x shares (see
 tandem/csrc/w4_gemv.cu).
 
-Kernels (tandem/csrc/w4_gemv.cu, built at load time): w4_gemv (M <= 4, CUDA cores) and w4_mma
-(M <= 16, tensor cores). Larger M (prefill) and machines without nvcc: dequantize to float16
-(Triton) and run cuBLAS.
+Kernels (tandem/csrc/w4_gemv.cu, built at load time): w4_gemv (M <= 4, CUDA cores), w4_mma
+(M <= 16, tensor cores) and w4_gemm (M > 16: prefill and large decode batches; tensor cores,
+x through a cp.async pipeline, weights dequantized in registers, optional split-K). Where the
+benchmark table says so, and on machines without nvcc: dequantize to float16 (Triton) + cuBLAS.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 import torch.nn.functional as F
@@ -152,8 +155,51 @@ W4_KERNELS: dict[str, dict[tuple[int, int, int], W4Kernel]] = {
 }
 
 
+# GEMM for M > 16 (prefill, decode batches over 16) per GPU and (N, K) / (N, K, "silu"):
+# ((m_max, config), ...) by increasing m_max, the fastest of benchmarks/bench_w4_gemm.py; M past
+# the last m_max uses the last entry. config = (MT, NT, WARPS_N, WARPS_K, STAGES, SPLITS) of w4_gemm
+# (tensor cores, weights dequantized in registers; SPLITS: split-K of every tile, or 0: of the
+# last, partial wave of tiles only), or None: dequantize to float16 + cuBLAS.
+# Shapes without an entry use DEFAULT_GEMM. TANDEM_W4_GEMM=0: always dequantize + cuBLAS.
+W4Gemm = tuple
+DEFAULT_GEMM: tuple[tuple[int, W4Gemm | None], ...] = ((32, (2, 4, 4, 2, 3, 0)), (1 << 30, (4, 4, 4, 1, 2, 0)))
+W4_GEMM_KERNELS: dict[str, dict[tuple, tuple[tuple[int, W4Gemm | None], ...]]] = {
+    # Qwen3-8B-AWQ, benchmarks/results/p2-w4g.jsonl (M = 17 .. 96) and p2-w4g2.jsonl (M = 128 ..
+    # 2048, with the last-wave split). Each shape keeps one choice for large M, where neighbouring
+    # M points flip within +-3% (cuBLAS's own tile choices): the GEMM, except down past M = 1024
+    # (dequantize + cuBLAS 2-10% faster there)
+    "NVIDIA GeForce RTX 3090": {
+        (6144, 4096): ((32, (2, 4, 4, 1, 3, 3)), (64, (4, 4, 4, 1, 2, 3)), (96, (2, 4, 4, 1, 3, 1)),  # qkv
+                       (160, (2, 4, 4, 1, 3, 0)), (1 << 30, (4, 4, 4, 1, 2, 0))),
+        (4096, 4096): ((17, (2, 4, 4, 2, 3, 2)), (32, (2, 4, 4, 1, 3, 2)), (48, (4, 2, 8, 1, 3, 2)),  # o
+                       (64, (4, 4, 4, 1, 2, 2)), (96, (2, 4, 4, 1, 3, 4)), (128, (4, 4, 4, 1, 2, 0)),
+                       (192, (2, 4, 4, 1, 3, 0)), (1 << 30, (4, 4, 4, 1, 2, 0))),
+        (24576, 4096): ((32, (2, 4, 4, 1, 3, 2)), (64, (4, 4, 4, 1, 2, 2)), (96, (2, 4, 4, 1, 3, 1)),  # gate_up
+                        (128, (4, 4, 4, 1, 2, 0)), (160, (2, 4, 4, 1, 3, 0)), (1 << 30, (4, 4, 4, 1, 2, 0))),
+        (24576, 4096, "silu"): ((32, (2, 4, 4, 1, 3, 2)), (64, (4, 4, 4, 1, 2, 2)), (96, (2, 4, 4, 1, 3, 1)),
+                                (128, (4, 4, 4, 1, 2, 0)), (160, (2, 4, 4, 1, 3, 0)), (1 << 30, (4, 4, 4, 1, 2, 0))),
+        (4096, 12288): ((17, (2, 2, 4, 2, 4, 6)), (24, (2, 4, 4, 1, 3, 4)), (32, (2, 2, 4, 2, 4, 1)),  # down
+                        (64, (2, 4, 4, 1, 3, 6)), (96, (2, 4, 4, 1, 3, 4)), (128, (4, 4, 4, 1, 2, 0)),
+                        (160, (2, 4, 4, 1, 3, 0)), (1024, (4, 4, 4, 1, 2, 0)), (1 << 30, None)),
+    },
+}
+FUSED_GEMM = os.environ.get("TANDEM_W4_GEMM", "1") != "0"
+
+
+def pick_gemm(table: tuple[tuple[int, W4Gemm | None], ...], m: int) -> W4Gemm | None:
+    for m_max, cfg in table:
+        if m <= m_max:
+            return cfg
+    return table[-1][1]
+
+
 def _cuda_ok(x: torch.Tensor) -> bool:
     return (x.dim() == 2 and x.shape[0] <= 16 and x.dtype == torch.float16 and x.is_contiguous()
+            and x.data_ptr() % 16 == 0)
+
+
+def _gemm_ok(x: torch.Tensor) -> bool:
+    return (FUSED_GEMM and x.is_cuda and x.dim() == 2 and x.dtype == torch.float16 and x.is_contiguous()
             and x.data_ptr() % 16 == 0)
 
 
@@ -163,8 +209,8 @@ class W4Linear(nn.Module):
     qkv / gate_up); ``finalize`` repacks them on the GPU into tandem's layout.
 
     ``enable_silu_mul`` (gate_up of a SwiGLU MLP, before ``finalize``): the layer returns
-    silu(gate) * up, [M, out_features / 2], instead of [gate | up]; at decode the tensor-core
-    kernel applies it in its epilogue (rows reordered by interleave_gate_up)."""
+    silu(gate) * up, [M, out_features / 2], instead of [gate | up]; the tensor-core kernels apply
+    it in their epilogue (rows reordered by interleave_gate_up)."""
 
     def __init__(self, in_features: int, out_features: int, group: int) -> None:
         super().__init__()
@@ -177,6 +223,7 @@ class W4Linear(nn.Module):
         self.register_buffer("qzeros", torch.empty(in_features // group, out_features // 8, dtype=torch.int32))
         self.register_buffer("scales", torch.empty(in_features // group, out_features, dtype=torch.float16))
         self.kernels: dict[tuple, W4Kernel] = {}
+        self.gemm_kernels: dict[tuple, tuple[tuple[int, W4Gemm | None], ...]] = {}
 
     def enable_silu_mul(self) -> bool:
         if not self.awq_layout or self.out_features % 16:
@@ -195,9 +242,13 @@ class W4Linear(nn.Module):
         self.register_buffer("zeros", zeros)
         self.awq_layout = False
         self.kernels = W4_KERNELS.get(device_name, {}) if device_name else {}
+        self.gemm_kernels = W4_GEMM_KERNELS.get(device_name, {}) if device_name else {}
         from tandem.layers import w4_cuda
 
-        w4_cuda.load()  # build now, not inside CUDA graph capture (cached after the first layer)
+        # build now, not inside CUDA graph capture (cached after the first layer); same for the
+        # GEMM's split-K workspace
+        if w4_cuda.load() is not None and packed.is_cuda:
+            w4_cuda.workspace(packed.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _cuda_ok(x):
@@ -218,8 +269,18 @@ class W4Linear(nn.Module):
                 if kind != "mma":
                     _, *cfg = DEFAULT_KERNEL
                 return ext.w4_mma(x, self.packed, self.scales, self.zeros, *cfg, 0)
-        # prefill (and no CUDA kernels): dequantize (gate_up: back in [gate | up] row order), cuBLAS,
-        # and the same activation kernel as the unfused path
+        elif _gemm_ok(x):  # M > 16: the GEMM, unless the table prefers dequantize + cuBLAS
+            from tandem.layers import w4_cuda
+
+            ext = w4_cuda.load()
+            if ext is not None:
+                key = (self.out_features, self.in_features) + (("silu",) if self.silu_mul else ())
+                cfg = pick_gemm(self.gemm_kernels.get(key, DEFAULT_GEMM), x.shape[0])
+                if cfg is not None:
+                    buf, locks = w4_cuda.workspace(x.device)
+                    return ext.w4_gemm(x, self.packed, self.scales, self.zeros, buf, locks, *cfg, int(self.silu_mul))
+        # no CUDA kernels, or the table's choice: dequantize (gate_up: back in [gate | up] row
+        # order), cuBLAS, and the same activation kernel as the unfused path
         w = w4_dequant(self.packed, self.scales, self.zeros, self.group, x.dtype, deinterleave=self.silu_mul)
         y = F.linear(x, w)
         return silu_and_mul(y) if self.silu_mul else y
