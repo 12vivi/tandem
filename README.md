@@ -1,20 +1,38 @@
 # Tandem
 
-面向特定模型的 LLM 推理框架原型：先在选定模型（Qwen3 稠密系列，以 Qwen3-8B 为准）上与 vLLM / SGLang 性能对齐，再在特定场景做专项优化，包括低 batch decode 的算子（A 场景）和显存 / 主机内存 / SSD 多级 KV 存储（B 场景）。设计方案、调研结论和每个组件的出处见 [docs/设计方案.md](docs/设计方案.md)。
+面向 Qwen3 的大模型推理引擎（Python 主干，热点用 Triton 和 CUDA C++ 自写内核）。先在同一张 RTX 3090 上与 vLLM、SGLang 的性能对齐，再在三类场景上超过它们：小模型低并发的 decode、4 bit AWQ 量化模型的 decode、多轮对话和共享长文档的分层 KV 缓存。
 
-> 状态：v0.1 原型。引擎主干（调度、分页 KV、radix 缓存）和参考模型实现可以在 CPU / GPU 上端到端运行，数值已与 HF Transformers 对齐。GPU 快速路径（FlashInfer、CUDA Graph、融合算子）还没有做（见下方"路线图"）。与 vLLM / SGLang 的同机对比已用过渡版本跑完 Qwen3-0.6B 和 Qwen3-8B 的对齐矩阵。v0.1 在 0.6B 上只有较强对手的 0.06–0.12，见 [docs/P0基线报告.md](docs/P0基线报告.md)。
+> 状态：0.2.0.dev0（2026-11-16）。P0 基线、P1 对齐已完成；P2 算子、P3 多级 KV 存储部分达成。每项结论的测量条件、没达到的部分和原因都在 `docs/` 的阶段报告里。
 
-## 已实现
+## 结果
 
-| 模块 | 内容 | 出处（详见设计方案 §4.0） |
-|---|---|---|
-| `scheduler/` | 连续批处理；token 预算下的分块 prefill，decode 优先；KV 不够时先淘汰前缀缓存，再按重算方式抢占 | Orca (OSDI'22)、Sarathi-Serve (OSDI'24)、vLLM V1 |
-| `cache/` | 引用计数的分页 KV 块；按页粒度组织的 radix 前缀树（LRU 淘汰、路径加锁） | PagedAttention (SOSP'23)、RadixAttention (SGLang, NeurIPS'24) |
-| `layers/`, `models/` | Llama / Qwen2 / Qwen3 / Qwen3-MoE，参数名与 HF 一致，可直接加载 safetensors；参考 attention 后端（CPU/GPU 通用） | HF Transformers 参考实现 |
-| `hybrid/` | **三路径专家执行**：每一步、每个专家在"GPU 常驻 / 换入 GPU / CPU 计算"中选择，使 PCIe 路径与 CPU 路径尽量同时结束；GPU 专家槽用 LRU 管理。冻结至 P4 | KTransformers (SOSP'25)、SGLang Paged Experts、自适应专家分配 (arXiv 2610.23006) |
-| `planner/` | 硬件画像（预设或实测）、屋顶线代价模型、显存放置计划、流式交叉点 T*。冻结至 P4，硬件画像复用到多级存储 | FlexGen (ICML'23)、MoE-Lightning (ASPLOS'25) |
-| `spec/`, `layers/sampler.py` | n-gram 草稿 + 投机采样验证（贪心模式下与普通解码逐 token 一致）；temperature / top-k / top-p / min-p | Leviathan et al. (ICML'23)、Prompt Lookup Decoding |
-| `entrypoints/` | OpenAI 兼容接口（completions / chat，SSE 流式，`include_usage`）；CLI：`serve` / `generate` / `plan` / `probe` | OpenAI API |
+同一台机器、同一块 RTX 3090（驱动 550），对手是 vLLM 0.32.0 和 SGLang 0.5.10（过渡版本）。每格与对手里最快的配置比，重复 3 次取中位数。倍数一栏都是"越大越好"：吞吐是 tandem / 对手，延迟是对手 / tandem。
+
+| 场景 | 指标 | tandem | 最强对手 | 倍数 | 详见 |
+|---|---|---|---|---|---|
+| 对齐矩阵，Qwen3-8B BF16（19 格） | 达标格数（吞吐 ≥0.95 倍，延迟 p50 ≤1.05、p99 ≤1.10 倍） | 19/19 | — | 吞吐 1.00–1.01 | [P1](docs/P1对齐报告.md) |
+| 对齐矩阵，Qwen3-0.6B（25 格） | 同上 | 24/25 | — | 吞吐 1.02–1.07 | [P1](docs/P1对齐报告.md) |
+| A1 小模型低并发，Qwen3-0.6B | TPOT p50，batch 1 / 4 / 8（ms） | 1.97 / 2.36 / 2.87 | 2.14 / 2.51 / 3.01 | 1.086 / 1.064 / 1.049 | [P2](docs/P2算子报告.md) |
+| A1，Qwen3-1.7B | 同上 | 4.56 / 4.99 / 5.60 | 4.76 / 5.24 / 5.74 | 1.044 / 1.050 / 1.025 | [P2](docs/P2算子报告.md) |
+| A2 4 bit AWQ，Qwen3-8B | 同上 | 6.63 / 7.20 / 8.52 | 7.22 / 7.70 / 8.94 | 1.089 / 1.069 / 1.049 | [P2](docs/P2算子报告.md) |
+| A2，并发 16 / 24 / 32 | TPOT p50（ms），对比 vLLM | 11.7 / 19.1 / 20.5 | 12.4 / 17.1 / 20.0 | 1.06 / 0.89 / 0.98 | [P2 §3.4](docs/P2算子报告.md) |
+| B2 共享长文档，0.1 req/s | TTFT p50（s），各加 30 GB 主机内存层 | 0.96 | 2.82 | 2.94 | [P3](docs/P3分层缓存报告.md) |
+| B1 多轮对话，192 会话 | TTFT p50（ms）/ SLO 达标 | 133 / 99.1% | 156 / 96.3% | 1.17 | [P3](docs/P3分层缓存报告.md) |
+| 无复用负载 | 开主机层后的吞吐变化 | −0.2% | −1.1% | — | [P3](docs/P3分层缓存报告.md) |
+
+没达到的：A1 0.6B 的目标是 1.2 倍，1.7B 的目标是 1.05 倍（只有 batch 4 压线）；A2 batch 8 在 1.05 倍的目标线上下（几次复测 1.048–1.051 倍）；AWQ 4096 token 提示词的 TTFT 是对手的 0.79–0.94 倍；AWQ 并发 24 比 vLLM 慢 11%；B1 的 TTFT 目标是 130 ms，差 3 ms。原因和下一步见各报告的"没完成的"一节。
+
+## 实现了什么
+
+| 模块 | 内容 |
+|---|---|
+| `scheduler/` | 连续批处理；分块 prefill（每步 2048 token）；prefill 优先；短 prefill 优先、单独成步；KV 不够时淘汰前缀缓存，或把长 prefill 换出到主机内存层；推迟调度（下一步在上一步快结束时才定，刚到的请求赶得上） |
+| `cache/` | 分页 KV、按页组织的 radix 前缀树；主机内存层：pinned 页池，写回走拷贝引擎（不占 SM），载入按层流水、与前向重叠 |
+| `engine/`、`executor/` | FlashInfer attention；decode 的 CUDA Graph（按 batch 分档，batch ≥8 另有不切分 KV 的 graph）；overlap 主循环（CPU 准备下一步时 GPU 在算这一步）；API 与引擎分两个进程 |
+| `layers/`、`csrc/` | 自写内核，按形状查表选配置。Triton：小 batch GEMV、split-KV decode attention、残差加 RMSNorm。CUDA C++（AWQ W4A16）：CUDA 核心 GEMV、tensor core decode 内核（权重直接读进 MMA 片段）、M > 16 的融合反量化 GEMM（cp.async 流水、最后一轮 split-K） |
+| `models/` | Qwen3 稠密模型（BF16 / FP16，AWQ 4 bit），参数名与 HF 一致，直接加载 safetensors；Llama、Qwen2、Qwen3-MoE 的参考实现 |
+| `entrypoints/` | OpenAI 兼容接口（completions / chat，SSE 流式，用量里报告命中缓存的 token）；CLI：`serve` / `generate` / `plan` / `probe` |
+| `hybrid/`、`planner/`、`spec/` | 三路径专家执行、放置规划、n-gram 投机解码：v0.1 的参考实现，冻结到 P4 |
 
 ## 快速开始
 
@@ -23,37 +41,47 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv -e ".[dev]"
 ```
 
-运行测试（不需要下载模型，用随机权重的小模型对齐 HF Transformers）：
+运行测试。没有 GPU 也能跑：用随机权重的小模型对齐 HF Transformers，GPU 测试自动跳过。
 
 ```bash
-.venv/Scripts/python -m pytest -q
+.venv/bin/python -m pytest -q
 ```
 
-查看放置计划（只需模型配置，不需要权重）：
+GPU 上启动服务（Linux，sm_80 及以上）。我们的环境是 torch 2.14.1+cu126、flashinfer-python 0.6.7.post2、Triton 3.8：
 
 ```bash
-.venv/Scripts/tandem plan --model Qwen3-30B-A3B --hw-profile rtx4090-desktop --weight-bits 4
+.venv/bin/tandem serve --model models/Qwen3-8B --kv-cache-gb 4 --port 8000
 ```
 
-用本地模型生成或启动服务（模型目录需包含 config.json、safetensors 和 tokenizer）：
+- AWQ 模型（AutoAWQ 的 gemm 格式）加 `--dtype float16`。第一次启动会编译 CUDA 内核，需要 `CUDA_HOME` 和 nvcc（我们用 CUDA 12.4、gcc 11.2）；
+- 主机内存 KV 层：加 `--host-kv-gb 30`；
+- 每项优化都有关闭开关，方便做对照，例如 `--no-small-batch-gemv`、`--no-small-batch-attention`、`--no-small-batch-norm`、`--no-late-schedule`、环境变量 `TANDEM_W4_GEMM=0`（完整列表见 `tandem serve --help`）。
 
-```bash
-.venv/Scripts/tandem generate --model models/Qwen3-0.6B --prompt "你好" --chat --max-tokens 64
-```
+Windows 上把 `.venv/bin/` 换成 `.venv/Scripts/`。
 
-```bash
-.venv/Scripts/tandem serve --model models/Qwen3-0.6B --port 8000
-```
+## 评测与复现
 
-Linux 上把 `.venv/Scripts/` 换成 `.venv/bin/`。
+- [benchmarks/README.md](benchmarks/README.md)：对齐矩阵（`run_matrix.py`）、复用场景（`run_reuse.py`）、逐算子剖析（`profile_engine.py`）、内核微基准（`bench_*.py`）的用法，以及服务器上要加的环境变量；
+- 每份阶段报告的最后一节是复现命令；原始结果在 `benchmarks/results/`，不进版本库。
 
-## 路线图（对应设计方案 §8）
+## 文档
 
-- **P0 基线**（进行中）：解决服务器环境，跑 vLLM / SGLang 在 Qwen3-8B 上的对齐矩阵和场景基线，逐算子剖析（`benchmarks/README.md`、`docs/P0基线报告.md`）。对齐矩阵已用过渡版本跑完（0.6B、8B），场景基线和逐算子剖析还没做。
-- **P1 对齐**：FlashInfer attention、CUDA Graph、融合小算子、批量采样、overlap 主循环、API 与引擎进程拆分；Qwen3-0.6B 和 Qwen3-8B BF16 达到 vLLM / SGLang 较好者的 0.95 倍以上。
-- **P2 算子**：W4A16 / W8A8 先对齐，再做模型专用融合、形状专用 GEMV、低 batch decode 持久化内核（研究线）。
-- **P3 多级存储**：L2 主机内存 / L3 NVMe KV 缓存、按层流水载入、载入 / 重算拆分、会话与 Agent 感知的保留和预取。P2 与 P3 可并行。
-- **P4 扩展**：Qwen3-30B-A3B 与三路径专家执行、专用草稿的投机解码、其他 GPU 上复测。
+| 文档 | 内容 |
+|---|---|
+| [设计方案](docs/设计方案.md) | 目标、对齐判据、架构、调研、路线图 |
+| [P0 基线报告](docs/P0基线报告.md) | 对手基线、逐算子剖析、A / B 场景的定义 |
+| [P1 对齐报告](docs/P1对齐报告.md) | 对齐结果和三处关键修正 |
+| [P2 算子报告](docs/P2算子报告.md) | 小 batch 内核、AWQ W4A16 |
+| [P3 实施计划](docs/P3实施计划.md)、[P3 分层缓存报告](docs/P3分层缓存报告.md) | 主机内存 KV 层的设计和结果 |
+| [面试复习](docs/面试复习.md) | 每项优化做了什么、为什么、证据在哪 |
+
+## 路线图（设计方案 §8）
+
+- **P0 基线**：完成（2026-11-13）。
+- **P1 对齐**：完成（2026-11-12）。
+- **P2 算子**：部分达成。A2 达标；A1 未达标，0.6B 到 1.2 倍要靠持久化内核，列为研究线。
+- **P3 多级存储**：部分达成。主机内存层完成，B2 和 B1 的 SLO 达标，B1 的 TTFT 差 3 ms；L3（NVMe）在这台机器上做不了。
+- **P4 扩展**：未开始。Qwen3-30B-A3B 与三路径专家执行、专用草稿的投机解码、在其他 GPU 上复测。
 
 ## 许可证
 

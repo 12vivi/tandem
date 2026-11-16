@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tandem"
 version = "0.2.0.dev0"
-description = "Tandem: a single-GPU + CPU heterogeneous LLM inference engine (prototype)"
+description = "Tandem: an LLM inference engine specialized for Qwen3 (prototype)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
