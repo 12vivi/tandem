@@ -61,6 +61,9 @@ class EngineConfig:
     cuda_graph_max_bs: int = 64  # largest captured decode batch (capped at max_num_seqs)
     # launch step N before step N-1's tokens reach the host (not with speculative decoding)
     overlap_schedule: bool = True
+    # with overlap, in the server: schedule step N+1 only shortly before step N ends, so requests
+    # arriving while N runs join N+1 (LLMEngine.input_wait); decode steps >= 10 ms only
+    late_schedule: bool = True
     # FlashInfer path: QK-norm + RoPE + KV write as one Triton kernel (tandem.layers.triton_ops);
     # falls back to the unfused kernels when Triton is missing
     fused_prologue: bool = True

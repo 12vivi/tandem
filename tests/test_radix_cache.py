@@ -162,3 +162,47 @@ def test_split_keeps_both_tiers_aligned():
     assert [n.host_value for n in m.host_nodes] == [[0]]
     m = rc.match(A + [0])
     assert [n.host_value for n in m.host_nodes] == [[0], [1]]
+
+
+def test_eviction_continues_past_written_back_leaves():
+    """A leaf without a host copy is written back into free host pages and dropped; its parent
+    must then be evicted too (the first version stopped there: the parent never became a
+    candidate, so eviction freed far less than asked and host hits were loaded only in part)."""
+    alloc, host, rc = _tiered(num_blocks=8, pages=8)
+    _cached(alloc, rc, A)  # 2 blocks, no host copy
+    _cached(alloc, rc, A + list(range(100, 108)))  # 2 more blocks under A, no host copy either
+    assert rc.evict(4) == 4 and alloc.num_free == 8
+    m = rc.match(A + list(range(100, 108)) + [0])
+    assert m.blocks == [] and m.num_host_blocks == 4  # both written back, in L2
+
+
+def test_eviction_waits_for_copies_only_when_needed():
+    """Nodes whose copy to the host is still running are skipped while others can be freed, and
+    waited for (oldest first) only when nothing else is left."""
+
+    class Event:
+        def __init__(self):
+            self.waited = False
+
+        def query(self):
+            return self.waited
+
+        def synchronize(self):
+            self.waited = True
+
+    class SlowHost(FakeHost):
+        def to_host(self, gpu, pages):
+            super().to_host(gpu, pages)
+            self.last = Event()
+            return self.last
+
+    alloc, host = BlockAllocator(8), SlowHost(8)
+    rc = RadixCache(4, alloc, host)
+    na, _ = _cached(alloc, rc, A)
+    rc.write_through(na)
+    ev_a = host.last  # A (the older one): copy still running
+    nb, _ = _cached(alloc, rc, B)
+    rc.write_through(nb)
+    host.last.waited = True  # B: copy done
+    assert rc.evict(2) == 2 and not ev_a.waited and nb.value is None and na.value is not None
+    assert rc.evict(2) == 2 and ev_a.waited and na.value is None  # nothing else left: wait for A

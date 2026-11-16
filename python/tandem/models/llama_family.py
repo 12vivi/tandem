@@ -91,7 +91,12 @@ class LlamaFamilyForCausalLM(nn.Module):
         emb = self.model.embed_tokens
         hidden = emb(input_ids) if input_ids.numel() == 1 else emb.weight[input_ids]
         residual = None
-        for layer in self.model.layers:
+        waits = ctx.layer_waits
+        for i, layer in enumerate(self.model.layers):
+            if waits is not None and waits[i]:  # this layer's prefix KV is still being loaded
+                stream = torch.cuda.current_stream()
+                for event in waits[i]:
+                    stream.wait_event(event)
             hidden, residual = layer(hidden, residual, self.rotary_emb, ctx)
         norm = self.model.norm
         hidden, _ = ctx.ops.fused_add_rms_norm(hidden, residual, norm.weight, norm.eps)

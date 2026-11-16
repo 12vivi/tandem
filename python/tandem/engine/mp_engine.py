@@ -22,6 +22,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -44,23 +45,43 @@ def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
 
         engine = LLMEngine(config, load_tokenizer=False)
         outbox.send(("ready",))
-        while True:
+        stopping = False
+
+        def drain() -> int:
+            """Handle the pending messages; returns how many requests were added."""
+            nonlocal stopping
+            added = 0
+            while inbox.poll(0):
+                msg = inbox.recv()
+                if msg[0] == "add":
+                    added += 1
+                    _, rid, prompt_ids, params = msg
+                    if TRACE:
+                        TRACE("add", rid=rid, n=len(prompt_ids), max_tokens=params.max_tokens)
+                    try:
+                        engine.add_request(prompt_token_ids=prompt_ids, sampling_params=params, request_id=rid)
+                    except Exception as exc:  # tell the caller instead of dying
+                        outbox.send(("error", rid, str(exc)))
+                elif msg[0] == "abort":
+                    engine.abort_request(msg[1])
+                elif msg[0] == "shutdown":
+                    stopping = True
+            return added
+
+        def wait_inputs(deadline: float) -> None:  # LLMEngine.input_wait: until a request or deadline
+            while not stopping:
+                left = deadline - time.perf_counter()
+                if left <= 0 or not inbox.poll(left) or drain():
+                    return
+
+        if config.late_schedule:
+            engine.input_wait = wait_inputs
+        while not stopping:
             busy = engine.has_unfinished_requests()
             if inbox.poll(0 if busy else 0.05):
-                while inbox.poll(0):
-                    msg = inbox.recv()
-                    if msg[0] == "add":
-                        _, rid, prompt_ids, params = msg
-                        if TRACE:
-                            TRACE("add", rid=rid, n=len(prompt_ids), max_tokens=params.max_tokens)
-                        try:
-                            engine.add_request(prompt_token_ids=prompt_ids, sampling_params=params, request_id=rid)
-                        except Exception as exc:  # tell the caller instead of dying
-                            outbox.send(("error", rid, str(exc)))
-                    elif msg[0] == "abort":
-                        engine.abort_request(msg[1])
-                    elif msg[0] == "shutdown":
-                        return
+                drain()
+            if stopping:
+                return
             if not engine.has_unfinished_requests():
                 continue
             outs = engine.step()

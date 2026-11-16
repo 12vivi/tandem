@@ -79,3 +79,70 @@ def test_max_tokens_and_eos_stop():
     s.add_request(r)
     _step(s)
     assert r.finished and r.finish_reason == "stop" and r.output_token_ids == [7]
+
+
+def _cached_scheduler(budget=8):
+    """Scheduler with a radix cache in which tokens 1..24 (6 blocks of 4) are cached."""
+    from tandem.cache.radix_cache import RadixCache
+
+    alloc = BlockAllocator(64)
+    s = Scheduler(alloc, block_size=4, max_num_seqs=8, max_num_batched_tokens=budget, max_model_len=1024,
+                  radix_cache=RadixCache(4, alloc))
+    s.add_request(_req("warm", 24, max_tokens=1))
+    while s.has_unfinished():
+        _step(s)
+    return s
+
+
+def test_short_prefill_goes_before_running_long_prefill():
+    """A request whose prompt is cached except for 2 tokens gets a step of its own ahead of the
+    next chunk of a long uncached prompt, which continues in the following step."""
+    s = _cached_scheduler()
+    s.add_request(Request("long", list(range(100, 140)), SamplingParams(max_tokens=2, ignore_eos=True)))
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("long", 8)]
+    short = Request("short", list(range(1, 25)) + [50, 51], SamplingParams(max_tokens=2, ignore_eos=True))
+    s.add_request(short)
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("short", 2)]
+    assert short.num_cached_tokens == 24
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("long", 8)]
+
+
+def test_short_prefills_shortest_first_up_to_the_step_cap():
+    s = _cached_scheduler(budget=64)
+    a = Request("a", list(range(1, 25)) + list(range(60, 70)), SamplingParams(max_tokens=2, ignore_eos=True))
+    b = Request("b", list(range(1, 25)) + [80, 81, 82], SamplingParams(max_tokens=2, ignore_eos=True))
+    s.add_request(a)
+    s.add_request(b)
+    s.SHORT_STEP_TOKENS = 3  # b (3 tokens left) fills the step
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("b", 3)]
+    assert [(x.request.request_id, x.num_tokens) for x in _step(s).scheduled] == [("a", 10)]
+
+
+def test_short_request_preempts_long_prefill_when_it_does_not_fit():
+    """GPU blocks are taken by a long prompt being prefilled; a request whose prompt is cached
+    (partly in host memory) except for 2 tokens needs 3 blocks: the long prefill is preempted
+    (swapped out to host memory) and the short request is admitted in the same step; both finish."""
+    from tandem.cache.radix_cache import RadixCache
+    from test_radix_cache import FakeHost
+
+    alloc = BlockAllocator(12)
+    s = Scheduler(alloc, block_size=4, max_num_seqs=8, max_num_batched_tokens=8, max_model_len=1024,
+                  radix_cache=RadixCache(4, alloc, FakeHost(32)))
+    s.SHORT_PREFILL = 4
+    s.add_request(_req("warm", 24, max_tokens=1))  # tokens 1..24 cached, written to host memory
+    while s.has_unfinished():
+        _step(s)
+    long = Request("long", list(range(100, 140)), SamplingParams(max_tokens=2, ignore_eos=True))
+    s.add_request(long)
+    for _ in range(4):  # 32 of 40 tokens: 8 blocks; part of warm's GPU copies evicted, kept in host memory
+        _step(s)
+    assert long.num_computed_tokens == 32 and alloc.num_free == 0
+    short = Request("short", list(range(1, 25)) + [50, 51], SamplingParams(max_tokens=2, ignore_eos=True))
+    s.add_request(short)
+    out = _step(s)
+    assert [(x.request.request_id, x.num_tokens) for x in out.scheduled] == [("short", 2)]
+    assert out.preempted == [long] and short.num_cached_tokens == 24
+    while s.has_unfinished():
+        _step(s)
+    assert long.num_output_tokens == 2 and short.num_output_tokens == 2
+    assert alloc.num_free + s.radix.num_cached_blocks == alloc.num_blocks

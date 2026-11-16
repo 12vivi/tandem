@@ -17,7 +17,7 @@ _DECL = """
 torch::Tensor pinned_empty(int64_t nbytes);
 int64_t device_ptr(torch::Tensor pinned);
 void kv_page_copy(torch::Tensor layer_ptrs, torch::Tensor gpu_blocks, torch::Tensor host_pages, int64_t host_dev_ptr,
-                  int64_t page_bytes, bool to_host);
+                  int64_t page_bytes, bool to_host, int64_t lk0, int64_t lk_count, int64_t ctas);
 """
 
 

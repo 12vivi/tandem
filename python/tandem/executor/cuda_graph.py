@@ -122,9 +122,11 @@ class CudaGraphRunner:
         seqs: Sequence[tuple[Sequence[int], int, int]],
         input_ids: Sequence[int],
         fixups: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        start_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """seqs: decode-only (block_ids, start, 1) per request -> hidden states [b, H].
-        fixups: (positions, token values) on the device for inputs still in flight."""
+        fixups: (positions, token values) on the device for inputs still in flight.
+        start_event: recorded right before the replay (step timing)."""
         b = len(seqs)
         bs = next(s for s in self.sizes if s >= b)
         layout = paged_layout(list(seqs) + self._dummy(bs - b), self.block_size)
@@ -145,6 +147,8 @@ class CudaGraphRunner:
             wrapper, graph, out = self.wrappers[bs], self.graphs[bs], self.outputs[bs]
             self.backend.plan_decode(wrapper, layout)
         TIMER.mark("graph_plan")
+        if start_event is not None:
+            start_event.record()
         graph.replay()
         TIMER.mark("graph_replay")
         return out[:b]

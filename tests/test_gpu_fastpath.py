@@ -463,19 +463,96 @@ def test_host_pool_cuda_copies_page_first():
             assert torch.equal(t[dst * 16 : (dst + 1) * 16], b[src * 16 : (src + 1) * 16])
 
 
-def test_greedy_with_host_tier(tiny_path, tiny_fp32):
-    """A prefix pushed out of a small GPU pool is loaded back from host memory asynchronously
-    (the request waits in the scheduler's loading list), with CUDA graphs on; outputs match the
-    GPU-only engine within near-ties."""
+def test_host_pool_freed_during_graph_capture():
+    """A host pool that the cyclic GC frees while a CUDA graph is being captured (PyTorch no longer
+    collects before a capture) must not call cudaFreeHost, which is not allowed during a capture:
+    the free waits for the next pool."""
+    import gc
+
+    from tandem.cache.host_pool import HostKVPool
+    from tandem.cache.kv_cache import KVCache
+
+    kv = KVCache(2, 5, 16, 2, 64, torch.bfloat16, torch.device("cuda"))
+    pool = HostKVPool(kv, 4)
+    if pool.ext is None:
+        pytest.skip("KV page-copy kernels did not build (no nvcc?)")
+    cycle = [pool]
+    cycle.append(cycle)  # only the cyclic GC can free the pool now
+    del pool, cycle
+    x = torch.zeros(16, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gc.collect()  # the pool's pinned memory is released inside the capture
+        y = x + 1
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(y, x + 1)
+    HostKVPool(kv, 4)  # frees the deferred buffer
+
+
+@pytest.mark.parametrize("tail", [[6, 7, 8], [9]], ids=["eager", "graph"])
+def test_greedy_with_host_tier(tiny_path, tiny_fp32, tail, monkeypatch):
+    """A prefix pushed out of a small GPU pool is loaded back from host memory in the step that
+    uses it, which waits for each layer's KV just before that layer. The copy stream is held back
+    ~10 ms before every load, so a layer that did not wait would read stale KV and change the
+    outputs; they match the GPU-only engine within near-ties. With tail [9] the prompt is 97
+    tokens: 96 come from host memory and the single remaining token runs as a decode-only CUDA
+    graph step, which waits for the whole copy before the replay."""
     shared = prompts(11, [100], vocab=VOCAB)[0]
     others = prompts(12, [60] * 4, vocab=VOCAB)
-    ps = [shared + [5], *others, shared + [6, 7]]
+    ps = [shared + [5], *others, shared[:96] + tail]
     kw = dict(num_kv_blocks=12, max_num_batched_tokens=128)  # 192 tokens of GPU KV
     base = [make(tiny_path, **kw).generate([p], GREEDY)[0] for p in ps]
     eng = make(tiny_path, host_kv_gb=0.05, **kw)
-    assert eng.host_pool is not None and eng.host_pool.ext is not None
+    pool = eng.host_pool
+    assert pool is not None and pool.ext is not None
+    copy, loads = pool._copy, []
+
+    def slow_copy(gpu_blocks, host_pages, to_host, per_layer):
+        if not to_host:
+            loads.append(len(gpu_blocks))
+            with torch.cuda.stream(pool.load_stream):
+                torch.cuda._sleep(20_000_000)
+        return copy(gpu_blocks, host_pages, to_host, per_layer)
+
+    monkeypatch.setattr(pool, "_copy", slow_copy)  # undone at teardown: no reference cycle left behind
+    graph_steps = eng.runner.num_graph_steps
     out = [eng.generate([p], GREEDY)[0] for p in ps]
-    assert out[-1].metrics["cached_tokens"] == 96  # 6 blocks of the shared prefix, from host memory
-    assert eng.radix.num_host_hit_tokens >= 96 and eng.runner.num_graph_steps > 0
+    assert out[-1].metrics["cached_tokens"] == 96 and 6 in loads  # 6 blocks of the shared prefix, from host memory
+    assert eng.radix.num_host_hit_tokens >= 96 and eng.runner.num_graph_steps > graph_steps
     for p, a, b in zip(ps, base, out):
         assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, b.output_token_ids, tol=0.3)
+
+
+def test_late_bound_schedule_takes_arrivals_into_next_step(tiny_path, tiny_fp32, monkeypatch):
+    """Late-bound scheduling: while a decode step runs, the engine waits in input_wait before
+    scheduling the next step, and a request that arrives during that wait is in the very next
+    launched step. Decode steps are made to look 20 ms long (the tiny model's are far below the
+    10 ms threshold). Outputs match the engine without it within near-ties."""
+    from tandem.executor.model_runner import InFlightStep
+
+    ps = prompts(21, [9, 14], vocab=VOCAB)
+    late = prompts(22, [11], vocab=VOCAB)[0]
+    ref = make(tiny_path).generate(ps + [late], GREEDY)
+    monkeypatch.setattr(InFlightStep, "gpu_seconds", lambda self: 0.02)
+    eng = make(tiny_path)
+    added = {}
+
+    def input_wait(deadline):
+        if "rid" not in added and len(eng.requests) == 2:
+            added["rid"] = eng.add_request(late, GREEDY)
+
+    eng.input_wait = input_wait
+    rids = [eng.add_request(p, GREEDY) for p in ps]
+    outs, next_step = {}, None
+    while eng.has_unfinished_requests():
+        before = "rid" in added
+        for o in eng.step():
+            if o.finished:
+                outs[o.request_id] = o
+        if not before and "rid" in added:
+            next_step = eng.inflight.sched  # launched right after the wait
+    assert next_step is not None and eng.decode_est == pytest.approx(0.02)
+    assert added["rid"] in [s.request.request_id for s in next_step.scheduled]
+    for p, a, rid in zip(ps + [late], ref, rids + [added["rid"]]):
+        assert_same_or_near_tie(tiny_fp32, p, a.output_token_ids, outs[rid].output_token_ids, tol=0.3)

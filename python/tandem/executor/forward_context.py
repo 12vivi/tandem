@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
@@ -34,6 +34,8 @@ class ForwardContext:
     moe_executor: Any
     positions: torch.Tensor = None  # [T] position of every token (RoPE)
     ops: Any = field(default_factory=TorchOps)  # tandem.layers.ops.TorchOps / FlashInferOps
+    # per decoder layer, CUDA events of host -> GPU KV loads to wait for before running it
+    layer_waits: Optional[list] = None
 
 
 def build_attention_metadata(

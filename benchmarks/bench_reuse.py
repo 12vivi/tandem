@@ -16,7 +16,9 @@ tokens and the reuse an infinitely large cache could get ("ideal reuse") is know
              requested before.
 
 Cached tokens per request come from usage.prompt_tokens_details.cached_tokens (vLLM:
---enable-prompt-tokens-details, SGLang: --enable-cache-report). One JSON line per run.
+--enable-prompt-tokens-details, SGLang: --enable-cache-report). One JSON line per run in --save,
+and one per request in <save stem>-requests.jsonl (send time from the start of the run, TTFT,
+latency, cached tokens, and which document / session turn it was).
 
   python benchmarks/bench_reuse.py subset --sharegpt benchmarks/data/ShareGPT_V3_unfiltered_cleaned_split.json \\
       --tokenizer models/Qwen3-8B --out benchmarks/data/sharegpt_multiturn_qwen3.jsonl
@@ -56,12 +58,15 @@ class Rec:
     out_tokens: int = 0
     error: str = ""
     itl: list[float] = field(default_factory=list)
+    key: str = ""       # "doc<i>" / "s<session>t<turn>"
+    start: float = 0.0  # perf_counter at send
 
 
 async def send(client: httpx.AsyncClient, url: str, model: str, prompt: list[int], rec: Rec) -> Rec:
     body = {"model": model, "prompt": prompt, "max_tokens": rec.output_len, "temperature": 0.0,
             "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
     t0 = time.perf_counter()
+    rec.start = t0
     last, chunks = t0, 0
     try:
         async with client.stream("POST", url, json=body) as resp:
@@ -204,7 +209,7 @@ async def run_multiturn(a: argparse.Namespace) -> tuple[list[Rec], float, dict]:
         turns = convs[i]["turns"]
         for k, turn in enumerate(turns):
             prompt = history + turn["user"]
-            rec = Rec("first" if k == 0 else "follow", len(prompt), prev, turn["out"])
+            rec = Rec("first" if k == 0 else "follow", len(prompt), prev, turn["out"], key=f"s{i}t{k}")
             recs.append(await send(client, a.url, a.model, prompt, rec))
             ctx[i] = len(prompt) + turn["out"] if k + 1 < len(turns) else 0
             peak[0] = max(peak[0], sum(ctx))
@@ -236,7 +241,7 @@ async def run_docs(a: argparse.Namespace) -> tuple[list[Rec], float, dict]:
         question = [rng.randrange(VOCAB) for _ in range(a.question_len)]
         prompt = docs[d] + question
         plan.append((prompt, Rec("warmup" if j < a.warmup else "measure", len(prompt),
-                                 len(docs[d]) if d in seen else 0, a.output_len)))
+                                 len(docs[d]) if d in seen else 0, a.output_len, key=f"doc{d}")))
         seen.add(d)
     recs = [r for _, r in plan]
     limits = httpx.Limits(max_connections=total + 8, max_keepalive_connections=64)
@@ -322,6 +327,16 @@ def main() -> None:
     if a.save:
         with open(a.save, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        stem, ext = os.path.splitext(a.save)
+        t0 = min((r.start for r in recs if r.start), default=0.0)
+        with open(f"{stem}-requests{ext}", "a", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps({"tag": a.tag, "workload": a.cmd, "level": a.sessions if a.cmd == "multiturn" else a.rate,
+                                    "time": row["time"], "key": r.key, "group": r.group,
+                                    "start_s": round(r.start - t0, 3) if r.start else None, "ok": r.ok,
+                                    "ttft_ms": ms(r.ttft) if r.ok else None, "latency_ms": ms(r.latency) if r.ok else None,
+                                    "prompt_len": r.prompt_len, "reusable": r.reusable, "cached": r.cached,
+                                    "out_tokens": r.out_tokens}) + "\n")
 
 
 if __name__ == "__main__":

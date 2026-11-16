@@ -24,6 +24,14 @@ class InFlightStep:
     tokens_host: Optional[torch.Tensor] = None  # pinned copy of the sampled tokens
     event: Any = None  # CUDA event recorded after the copy (None on the CPU)
     results: Optional[dict[str, list[int]]] = None  # already known (synchronous paths)
+    decode_only: bool = False  # one token per request (a CUDA-graph decode step)
+    start_event: Any = None  # timing events around the step on the GPU (CUDA only)
+
+    def gpu_seconds(self) -> Optional[float]:
+        """GPU time of the step, once resolved (timing events only)."""
+        if self.start_event is None or self.event is None:
+            return None
+        return self.start_event.elapsed_time(self.event) / 1e3
 
     def resolve(self) -> dict[str, list[int]]:
         if self.results is None:
@@ -103,13 +111,23 @@ class ModelRunner:
                       self.prev_tokens[torch.tensor(fix_rows, dtype=torch.long).to(self.device, non_blocking=True)])
             TIMER.mark("fixups")
 
+        loads = [h for h in sched.load_handles if not h.query()]  # host -> GPU KV copies still running
         decode_only = offset == len(seqs)  # one new token per request
+        # timing starts right before the forward, after the input copies and plan(): a step
+        # launched late must not count the host's preparation as GPU time
+        start_event = torch.cuda.Event(enable_timing=True) if self.device.type == "cuda" else None
         if self.graph_runner is not None and decode_only and self.graph_runner.can_run(len(seqs)):
-            hidden = self.graph_runner.run(seqs, input_ids, fixups)
+            for h in loads:  # a graph replays whole: wait for the complete copies first
+                torch.cuda.current_stream().wait_event(h.events[-1])
+            hidden = self.graph_runner.run(seqs, input_ids, fixups, start_event=start_event)
             self.num_graph_steps += 1
         else:
             positions, attn_meta = self.attn_backend.prepare(seqs, self.block_size, self.device)
             ctx = ForwardContext(attn_meta, self.kv_cache, self.attn_backend, self.moe_executor, ops=self.ops)
+            if loads:  # each layer waits only for its own KV (copies overlap the forward pass)
+                ctx.layer_waits = [[h.events[i] for h in loads] for i in range(len(self.kv_cache.k))]
+            if start_event is not None:
+                start_event.record()
             ids = torch.tensor(input_ids, dtype=torch.long).to(self.device, non_blocking=True)
             if fixups is not None:
                 ids[fixups[0]] = fixups[1]
@@ -139,9 +157,10 @@ class ModelRunner:
             buf = self._host_tokens[turn] = torch.empty(max(256, tokens.numel()), dtype=torch.long, pin_memory=True)
         host = buf[: tokens.numel()]
         host.copy_(tokens, non_blocking=True)
-        event = torch.cuda.Event()
+        event = torch.cuda.Event(enable_timing=True)
         event.record()
-        return InFlightStep(sched, reqs, tokens_host=host, event=event)
+        return InFlightStep(sched, reqs, tokens_host=host, event=event, decode_only=decode_only,
+                            start_event=start_event)
 
     @staticmethod
     def _verify(logits: torch.Tensor, owners: list[tuple[Request, int]]) -> dict[str, list[int]]:

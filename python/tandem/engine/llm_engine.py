@@ -138,6 +138,21 @@ class LLMEngine:
         # drafts depend on the latest tokens, so speculative decoding keeps the synchronous loop
         self.overlap = config.overlap_schedule and self.proposer is None
         self.inflight = None  # launched step whose tokens are not processed yet (overlap)
+        # Late-bound scheduling (overlap only; set by the engine-core process): while a decode step
+        # runs, step N+1 is scheduled only shortly before it ends, and requests arriving meanwhile
+        # are taken in through ``input_wait(deadline)``, which returns at the first arrival: the next
+        # step is then a prefill step, whose eager launch takes longer than a graph replay, so it is
+        # launched right away. Otherwise a request that arrives while step N runs waits for step
+        # N+1 too, one whole decode step more of TTFT. No wait when requests are queued already.
+        # ``decode_est`` is an EMA of the GPU time of decode steps (CUDA events, not wall time: a
+        # late launch must not lengthen the estimate); the margin covers scheduling and launching
+        # N+1.
+        self.input_wait = None
+        self.decode_est = 0.0
+        self.host_launch_est = 0.0
+        self.jit_min_step = 0.010  # shorter steps (small models) are scheduled at once
+        self.jit_margin_floor = 0.002
+        self._last_resolve = 0.0
 
         self.tokenizer = tokenizer
         if self.tokenizer is None and load_tokenizer:
@@ -271,7 +286,15 @@ class LLMEngine:
     def _step_overlap(self) -> list[RequestOutput]:
         """Launch step N, then finish step N-1 on the host while the GPU runs step N: its
         tokens become N's inputs on the device, so the host never waits before launching."""
+        running = self.inflight
+        if (self.input_wait is not None and running is not None and running.decode_only
+                and self.decode_est >= self.jit_min_step and not self.scheduler.waiting):
+            margin = max(0.25 * self.decode_est, 2 * self.host_launch_est, self.jit_margin_floor)
+            deadline = self._last_resolve + self.decode_est - margin  # the running step began then
+            if time.perf_counter() < deadline:
+                self.input_wait(deadline)
         TIMER.start()
+        t_sched = time.perf_counter()
         sched = self.scheduler.schedule()
         TIMER.mark("schedule")
         if TRACE and not sched.is_empty:
@@ -283,12 +306,19 @@ class LLMEngine:
             launched = self.runner.launch(sched)
             self.scheduler.on_launch(sched)
             self.num_steps += 1
+            t = time.perf_counter() - t_sched
+            self.host_launch_est = t if self.host_launch_est == 0 else 0.8 * self.host_launch_est + 0.2 * t
             TIMER.mark("book")
         prev, self.inflight = self.inflight, launched
         if prev is None:
             TIMER.end_step()
             return []
         sampled = prev.resolve()
+        self._last_resolve = time.perf_counter()
+        if prev.decode_only:
+            gpu = prev.gpu_seconds()
+            if gpu is not None:
+                self.decode_est = gpu if self.decode_est == 0 else 0.7 * self.decode_est + 0.3 * gpu
         TIMER.mark("wait_gpu")
         updated = self.scheduler.update_resolved(prev.sched, sampled)
         TIMER.mark("update")
@@ -385,6 +415,5 @@ class LLMEngine:
             if self.host_pool is not None:
                 s["host_hit_rate"] = round(self.radix.host_hit_rate, 4)
                 s["host_cached_pages"] = self.radix.num_host_pages
-                s["loading"] = len(self.scheduler.loading)
         s.update({f"moe_{k}": v for k, v in self.moe_executor.stats().items()})
         return s

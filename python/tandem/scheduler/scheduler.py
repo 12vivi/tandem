@@ -9,14 +9,34 @@
 * Preemption by recompute: the victim's computed blocks are inserted into the radix
   cache first, so resuming it is mostly a cache hit.
 * With a host-memory tier (design doc §4.4): a request whose cached prefix continues in host
-  memory waits in ``loading`` while those pages are copied back, without holding up the
-  others; finished prompts and requests are written through to host memory, so evicting them
-  from the GPU later costs nothing and preemption effectively swaps out.
+  memory is admitted in the same step that starts copying those pages back; the step waits
+  for each layer's KV just before that layer (``SchedulerOutput.load_handles``), so the copy
+  overlaps the forward pass (layer-wise pipelining, HiCache). Completed prompts are written
+  through to host memory, so evicting them from the GPU later costs nothing; a preempted
+  request is written out whole (swap-out). Generated tokens of finished requests are not
+  written through: they are rarely the prefix of a later prompt (chat templates re-render
+  replies) and would push reusable prompts out of host memory; they reach it only if free
+  host pages are left when they are evicted from the GPU.
+* A waiting request is admitted only if the part of its prefix that is in host memory and its
+  first chunk fit in free or evictable blocks; otherwise it waits whole (a partial load would
+  be recomputed, and repeated on every step while it is blocked).
+* Short prefills first, in steps of their own: a waiting request that has at most SHORT_PREFILL
+  tokens left to compute once its cached prefix (GPU or host memory) is reused is admitted
+  before the running prefill chunks and the waiting requests ahead of it, if its KV fits; the
+  shortest first, until the step holds SHORT_STEP_TOKENS; and that step carries no chunk of a
+  long prompt (only decodes, with decode_first). Otherwise a request that only needs its cached
+  document loaded waits behind every chunk of a long uncached prompt, and its first token waits
+  for the 2048-token chunk it shares a step with. Above ~256 tokens a prefill step is
+  compute-bound, so splitting it costs no throughput and the first requests finish earlier.
+  When a short request does not fit, the running prefills with the most left (more than
+  SHORT_PREFILL) are preempted for it, i.e. swapped out to host memory; it is admitted once
+  their copies have landed (eviction waits for them), and they resume after it.
 """
 
 from __future__ import annotations
 
 import time
+import itertools
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -41,6 +61,8 @@ class ScheduledRequest:
 class SchedulerOutput:
     scheduled: list[ScheduledRequest] = field(default_factory=list)
     preempted: list[Request] = field(default_factory=list)
+    # host -> GPU loads (tandem.cache.host_pool.LoadHandle) this step's prefixes wait for
+    load_handles: list = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -52,6 +74,10 @@ class SchedulerOutput:
 
 
 class Scheduler:
+    SHORT_PREFILL = 512  # tokens left after the cached prefix: admitted ahead of long prefills
+    SHORT_LOOKAHEAD = 8  # waiting requests examined for that per step
+    SHORT_STEP_TOKENS = 256  # a step of short prefills takes more of them only below this
+
     def __init__(
         self,
         allocator: BlockAllocator,
@@ -78,7 +104,6 @@ class Scheduler:
         self.radix = radix_cache
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
-        self.loading: list[tuple[Request, list]] = []  # (request, copy events) waiting for host -> GPU loads
         self.num_preemptions = 0
 
     # ------------------------------------------------------------------ queue API
@@ -87,7 +112,7 @@ class Scheduler:
         self.waiting.append(req)
 
     def has_unfinished(self) -> bool:
-        return bool(self.waiting or self.running or self.loading)
+        return bool(self.waiting or self.running)
 
     def finish_request(self, req: Request, status: RequestStatus) -> None:
         """Finish a request from outside the step loop (stop string, abort)."""
@@ -97,8 +122,6 @@ class Scheduler:
             self.running.remove(req)
         elif req in self.waiting:
             self.waiting.remove(req)
-        else:
-            self.loading = [(r, e) for r, e in self.loading if r is not req]
         self._release(req, cache=status != RequestStatus.FINISHED_ABORTED)
         req.status = status
         req.finish_time = time.monotonic()
@@ -115,59 +138,35 @@ class Scheduler:
         req.block_ids.extend(self.allocator.allocate(need))
         return True
 
-    def _match_prefix(self, req: Request) -> bool:
-        """Reuse the cached prefix of a waiting request. Returns False when part of it is being
-        copied back from host memory: the request then waits in ``self.loading``."""
+    def _match_prefix(self, req: Request) -> list:
+        """Reuse the cached prefix of a waiting request, loading the part that is only in host
+        memory. Returns the loads (LoadHandle) its prefix still waits for."""
         if self.radix is None or req.block_ids:
-            return True
+            return []
         tokens = req.all_token_ids
         # Leave at least one token to compute so the step yields logits.
         max_match = (len(tokens) - 1) // self.bs * self.bs
         if max_match <= 0:
-            return True
-        m = self.radix.match(tokens[:max_match], count=not req.rematch)  # after a load: counted already
-        req.rematch = False
-        events = list(m.pending)
+            return []
+        m = self.radix.match(tokens[:max_match], count=not req.prefix_counted)  # once per request
+        req.prefix_counted = True
         if m.host_nodes and self.radix.host is not None:
             self.radix.inc_lock(m.host_nodes[-1])  # nothing on the path may be evicted to make room
-            loaded, event = self.radix.load(m.host_nodes)
+            loaded, _ = self.radix.load(m.host_nodes)
             self.radix.dec_lock(m.host_nodes[-1])
-            if loaded:
-                m.node = loaded[-1]
-                if event is not None:
-                    events.append(event)
-                else:  # synchronous copy (CPU): the loaded nodes are already in L1
-                    m = self.radix.match(tokens[:max_match], count=False)
-        if any(not e.query() for e in events):
-            self.radix.inc_lock(m.node)
-            req.prefix_node = m.node
-            self.loading.append((req, events))
-            return False
+            if loaded:  # now in L1 (the copy may still be running: m.pending)
+                m = self.radix.match(tokens[:max_match], count=False)
         blocks, node = m.blocks, m.node
         if not blocks:
-            return True
+            return []
         self.allocator.incref(blocks)
         self.radix.inc_lock(node)
         req.block_ids = list(blocks)
         req.prefix_node = node
         req.num_computed_tokens = len(blocks) * self.bs
-        req.num_cached_tokens = req.num_computed_tokens
-        return True
-
-    def _poll_loads(self) -> None:
-        """Requests whose host -> GPU loads have landed go back to the head of the queue (and
-        then match their whole prefix in L1)."""
-        if not self.loading:
-            return
-        ready, still = [], []
-        for item in self.loading:  # one query per request: an event may complete meanwhile
-            (ready if all(x.query() for x in item[1]) else still).append(item)
-        self.loading = still
-        for req, _ in reversed(ready):
-            self.radix.dec_lock(req.prefix_node)
-            req.prefix_node = None
-            req.rematch = True
-            self.waiting.appendleft(req)
+        if req.num_preemptions == 0:  # the hit of the first admission (as vLLM reports it), not its own
+            req.num_cached_tokens = req.num_computed_tokens  # blocks found again after a preemption
+        return m.pending
 
     def _cache_computed_blocks(self, req: Request) -> None:
         """Insert the request's full computed blocks into the radix cache (request keeps running)."""
@@ -189,12 +188,14 @@ class Scheduler:
         if req.num_computed_tokens >= req.num_prompt_tokens:  # the prompt is complete: keep a host copy
             self.radix.write_through(node)
 
-    def _release(self, req: Request, cache: bool) -> None:
+    def _release(self, req: Request, cache: bool, write: bool = False) -> None:
+        """``write``: also start copying the request's KV to host memory (swap-out on preemption)."""
         if self.radix is not None and cache:
             n_full = min(req.num_computed_tokens // self.bs, len(req.block_ids))
             if n_full:
                 node, _ = self.radix.insert(req.all_token_ids[: n_full * self.bs], req.block_ids[:n_full])
-                self.radix.write_through(node)
+                if write:
+                    self.radix.write_through(node)
         if self.radix is not None and req.prefix_node is not None:
             self.radix.dec_lock(req.prefix_node)
         req.prefix_node = None
@@ -203,7 +204,7 @@ class Scheduler:
         req.block_ids = []
 
     def _preempt(self, req: Request) -> None:
-        self._release(req, cache=True)
+        self._release(req, cache=True, write=True)
         req.num_computed_tokens = 0
         req.spec_token_ids = []
         req.status = RequestStatus.WAITING
@@ -213,7 +214,6 @@ class Scheduler:
 
     # ------------------------------------------------------------------ schedule
     def schedule(self) -> SchedulerOutput:
-        self._poll_loads()
         if self.policy == "prefill_first" and (self.waiting or any(not r.is_decoding for r in self.running)):
             out = self._schedule(decodes=False)
             if not out.is_empty:  # nothing to prefill now (e.g. no KV room): decode below
@@ -223,10 +223,20 @@ class Scheduler:
     def _schedule(self, decodes: bool) -> SchedulerOutput:
         out = SchedulerOutput()
         budget = self.max_num_batched_tokens
-
-        # 1) running requests, decode first (stall-free batching), then prefill chunks
         order = ([r for r in self.running if r.is_decoding] if decodes else []) + [
             r for r in self.running if not r.is_decoding]
+
+        # 0) waiting requests whose prefix is (nearly) all cached, in a step of their own: no
+        # chunk of a long prompt, no other admission (the running decodes still go along)
+        short_step = False
+        if self.radix is not None and self.waiting:
+            budget = self._admit_short(out, budget)
+            short_step = not out.is_empty
+            if short_step:
+                order = [r for r in order if r.is_decoding]
+                budget = max(budget, len(order))  # decodes take one token each
+
+        # 1) running requests, decode first (stall-free batching), then prefill chunks
         i = 0
         while i < len(order) and budget > 0:
             req = order[i]
@@ -254,12 +264,16 @@ class Scheduler:
             budget -= n
             i += 1
 
-        # 2) admit waiting requests (skip this step if we just had to preempt)
-        while not out.preempted and self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+        # 2) admit waiting requests (skip this step if we just had to preempt, or if it is a
+        # step of short prefills)
+        while (not out.preempted and not short_step and self.waiting and budget > 0
+               and len(self.running) < self.max_num_seqs):
             req = self.waiting[0]
-            if not self._match_prefix(req):  # waits in self.loading
-                self.waiting.popleft()
-                continue
+            if self.radix is not None and not req.block_ids:
+                need, room = self._room(req, budget)
+                if need > room:  # its cached prefix and first chunk do not fit: it waits whole
+                    break
+            loads = self._match_prefix(req)
             n = min(req.num_tokens - req.num_computed_tokens, budget)
             if not self._ensure_blocks(req, req.num_computed_tokens + n):
                 self._release(req, cache=False)
@@ -269,8 +283,82 @@ class Scheduler:
             req.status = RequestStatus.RUNNING
             self.running.append(req)
             out.scheduled.append(ScheduledRequest(req, n))
+            out.load_handles.extend(h for h in loads if h not in out.load_handles)
             budget -= n
         return out
+
+    def _admit_short(self, out: SchedulerOutput, budget: int) -> int:
+        """Among the first SHORT_LOOKAHEAD waiting requests, admit those that have at most
+        SHORT_PREFILL tokens left once their cached prefix is reused, shortest first, while the
+        step holds fewer than SHORT_STEP_TOKENS: ahead of the running prefill chunks and of the
+        waiting requests in front of them. One whose blocks do not fit (free or evictable) has
+        long running prefills preempted for it (_preempt_for). Returns the budget left."""
+        shorts = []
+        for k, req in enumerate(itertools.islice(self.waiting, self.SHORT_LOOKAHEAD)):
+            tokens = req.all_token_ids
+            max_match = (len(tokens) - 1) // self.bs * self.bs
+            if max_match <= 0 or req.block_ids:
+                continue
+            m = self.radix.match(tokens[:max_match], count=False)  # a look only
+            left = len(tokens) - (len(m.blocks) + m.num_host_blocks) * self.bs
+            if left <= self.SHORT_PREFILL:
+                shorts.append((left, k, req))
+        step_tokens = 0
+        for left, _, req in sorted(shorts, key=lambda x: x[:2]):
+            if budget < left or len(self.running) >= self.max_num_seqs or step_tokens >= self.SHORT_STEP_TOKENS:
+                break
+            need, room = self._room(req, budget)
+            if need > room and not self._preempt_for(need - room, out):
+                continue
+            loads = self._match_prefix(req)
+            n = min(req.num_tokens - req.num_computed_tokens, budget)
+            if not self._ensure_blocks(req, req.num_computed_tokens + n):
+                self._release(req, cache=False)
+                req.num_computed_tokens = 0
+                continue
+            self.waiting.remove(req)
+            req.status = RequestStatus.RUNNING
+            self.running.append(req)
+            out.scheduled.append(ScheduledRequest(req, n))
+            out.load_handles.extend(h for h in loads if h not in out.load_handles)
+            budget -= n
+            step_tokens += n
+        return budget
+
+    def _room(self, req: Request, budget: int) -> tuple[int, int]:
+        """(blocks to allocate to admit ``req``: the part of its cached prefix that is in host
+        memory and its first chunk; blocks that are free or evictable, not counting its own
+        prefix in GPU memory)."""
+        tokens = req.all_token_ids
+        max_match = (len(tokens) - 1) // self.bs * self.bs
+        m = self.radix.match(tokens[:max_match], count=False) if max_match > 0 else None
+        cached = (len(m.blocks) + m.num_host_blocks) * self.bs if m else 0
+        first = min(len(tokens) - cached, budget)
+        need = cdiv(cached + first, self.bs) - (len(m.blocks) if m else 0)
+        return need, self.allocator.num_free + self.radix.num_evictable_blocks(keep=m.node if m else None)
+
+    def _preempt_for(self, blocks: int, out: SchedulerOutput) -> bool:
+        """Preempt running requests that are still prefilling with more than SHORT_PREFILL
+        tokens left, most left first, until about ``blocks`` blocks become evictable (once their
+        copies to host memory land). False, and nothing preempted, if that is not enough."""
+        if self.radix.host is None:
+            return False
+        long = sorted((r for r in self.running if not r.is_decoding
+                       and r.num_prompt_tokens - r.num_computed_tokens > self.SHORT_PREFILL),
+                      key=lambda r: r.num_prompt_tokens - r.num_computed_tokens, reverse=True)
+        victims, gain = [], 0
+        for r in long:
+            if gain >= blocks:
+                break
+            victims.append(r)
+            gain += len(r.block_ids)
+        if gain < blocks:
+            return False
+        for r in victims:
+            self.running.remove(r)
+            self._preempt(r)
+            out.preempted.append(r)
+        return True
 
     # -------------------------------------------------------------------- update
     def update_from_output(self, out: SchedulerOutput, sampled: dict[str, list[int]]) -> list[Request]:

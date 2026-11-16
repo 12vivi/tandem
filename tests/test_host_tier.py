@@ -53,8 +53,10 @@ def test_preemption_with_host_tier_keeps_outputs(tiny_model):
     assert eng.scheduler.num_preemptions > 0
     for a, b in zip(ref, out):
         assert a.output_token_ids == b.output_token_ids
+    # unique prompts: no request found a cached prefix at its first admission (resuming after a
+    # preemption finds its own blocks again, which is not a cache hit)
+    assert all(o.metrics["cached_tokens"] == 0 for o in out)
     assert eng.allocator.num_free + eng.radix.num_cached_blocks == eng.allocator.num_blocks
-    assert not eng.scheduler.loading
 
 
 def test_host_pool_page_layout_round_trip(tiny_model):

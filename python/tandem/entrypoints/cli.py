@@ -28,6 +28,8 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-cuda-graph", action="store_true", help="run decode steps eagerly")
     p.add_argument("--cuda-graph-max-bs", type=int, default=64)
     p.add_argument("--no-overlap", action="store_true", help="wait for each step's tokens before scheduling the next")
+    p.add_argument("--no-late-schedule", action="store_true",
+                   help="schedule each step as soon as the previous one is launched (overlap mode)")
     p.add_argument("--no-fused-prologue", action="store_true",
                    help="unfused QK-norm / RoPE / KV write instead of one Triton kernel (FlashInfer backend)")
     p.add_argument("--no-small-batch-gemv", action="store_true",
@@ -74,6 +76,7 @@ def _engine_config(args):
         small_batch_gemv=not args.no_small_batch_gemv,
         small_batch_attention=not args.no_small_batch_attention,
         small_batch_norm=not args.no_small_batch_norm,
+        late_schedule=not args.no_late_schedule,
         speculative=SpeculativeConfig(method=args.spec, num_speculative_tokens=args.num_spec_tokens),
         hybrid=HybridConfig(enabled=args.hybrid, gpu_expert_slots=args.gpu_expert_slots,
                             vram_budget_gb=args.vram_budget_gb, hw_profile=args.hw_profile),

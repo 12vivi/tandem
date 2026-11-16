@@ -240,8 +240,15 @@ class RadixCache:
             yield node
             stack.extend(node.children.values())
 
-    def num_evictable_blocks(self) -> int:
-        return sum(len(n.value) for n in self._iter_nodes() if n.lock_ref == 0 and n.value is not None)
+    def num_evictable_blocks(self, keep: Optional[RadixNode] = None) -> int:
+        """GPU blocks of unlocked nodes, not counting the path root -> ``keep`` (a prefix about to
+        be locked by the request that matched it)."""
+        skip = set()
+        while keep is not None and keep is not self.root:
+            skip.add(id(keep))
+            keep = keep.parent
+        return sum(len(n.value) for n in self._iter_nodes()
+                   if n.lock_ref == 0 and n.value is not None and id(n) not in skip)
 
     # ------------------------------------------------------------------- host copies
     def _alloc_host(self, n: int, make_room: bool) -> Optional[list[int]]:
@@ -354,33 +361,34 @@ class RadixCache:
 
         heap = [(n.last_access, next(tie), n) for n in self._iter_nodes() if candidate(n)]
         heapq.heapify(heap)
-        freed, writing = 0, []
-        while freed < num_blocks and heap:
-            _, _, node = heapq.heappop(heap)
-            if not candidate(node):
-                continue
-            parent = node.parent
-            if self.host is not None and node.host_value is not None:
-                if not _done(node.write_event):
-                    writing.append(node)
+        writing: list = []  # (last_access, tie, node) whose copy to the host is still running
+        freed = 0
+        while freed < num_blocks and (heap or writing):
+            if heap:
+                _, _, node = heapq.heappop(heap)
+                if not candidate(node):
                     continue
-                node.write_event = None
-                freed += self._drop_gpu(node)  # stays in L2
-            elif self.host is not None and self._write([node], make_room=False):
-                writing.append(node)  # written back below once the copy lands
-                continue
-            else:
-                freed += self._remove(node)
+                if self.host is None or (node.host_value is None and not self._write([node], make_room=False)):
+                    parent = node.parent  # no host copy and no free host page: gone
+                    freed += self._remove(node)
+                    if parent is not self.root and candidate(parent):
+                        heapq.heappush(heap, (parent.last_access, next(tie), parent))
+                    continue
+                if not _done(node.write_event):  # copy to the host still running: only if needed
+                    heapq.heappush(writing, (node.last_access, next(tie), node))
+                    continue
+            else:  # every candidate left waits for its copy to the host: wait for the oldest
+                _, _, node = heapq.heappop(writing)
+                node.write_event.synchronize()
+                if not candidate(node):
+                    continue
+            # the node stays in L2; its parent may now be a candidate (a parent whose children
+            # are being written back would otherwise never be reached)
+            node.write_event = None
+            parent = node.parent
+            freed += self._drop_gpu(node)
             if parent is not self.root and candidate(parent):
                 heapq.heappush(heap, (parent.last_access, next(tie), parent))
-        for node in writing:  # under pressure: wait for write-backs in flight
-            if freed >= num_blocks:
-                break
-            if node.write_event is not None:
-                node.write_event.synchronize()
-                node.write_event = None
-            if candidate(node):
-                freed += self._drop_gpu(node)
         return freed
 
     def evict_host(self, num_pages: int) -> int:
