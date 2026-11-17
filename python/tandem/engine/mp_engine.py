@@ -35,9 +35,6 @@ from tandem.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
-# input_wait checks this often whether the running step has finished on the GPU
-WAIT_SLICE = 0.0005
-
 
 def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
     """Entry point of the engine-core process."""
@@ -74,12 +71,15 @@ def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
         def wait_inputs(deadline: float) -> None:
             """LLMEngine.input_wait: until a request arrives, the deadline passes, or the running
             step has finished on the GPU (when its estimate runs long, waiting for the deadline
-            would leave the GPU idle and delay every request in the next step)."""
+            would leave the GPU idle and delay every request in the next step). It spins, like
+            the CUDA synchronize it stands in for: sleeping here (select) let the CPU clock down
+            between steps (one frequency for all cores on the RTX 3090 server's i7-10700K,
+            powersave governor), and the API process and the clients then ran 4-6x slower around
+            each wave of arrivals: +10-15 ms of TTFT on Qwen3-8B 256/1024 at concurrency 4."""
             while not stopping:
-                left = deadline - time.perf_counter()
-                if left <= 0:
+                if time.perf_counter() >= deadline:
                     return
-                if inbox.poll(min(left, WAIT_SLICE)):
+                if inbox.poll(0):
                     if drain():
                         return
                 elif engine.inflight_done():
