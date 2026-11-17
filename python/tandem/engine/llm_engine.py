@@ -148,7 +148,9 @@ class LLMEngine:
         # is being prefilled. No wait when requests are queued already. The estimates come from the
         # GPU time of past steps (CUDA events, not wall time: a late launch must not lengthen them):
         # an EMA for decode steps, an EMA per token for prefill steps (without host -> GPU loads,
-        # which can make a step wait); the margin covers scheduling and launching N+1.
+        # which can make a step wait); the margin covers scheduling and launching N+1. An estimate
+        # that runs long (the per-token EMA of long prompts applied to short ones) is cut short:
+        # input_wait also returns once step N has finished on the GPU (inflight_done).
         self.input_wait = None
         self.decode_est = 0.0
         self.prefill_tok_est = 0.0
@@ -271,6 +273,12 @@ class LLMEngine:
 
     def has_unfinished_requests(self) -> bool:
         return self.scheduler.has_unfinished() or self.inflight is not None
+
+    def inflight_done(self) -> bool:
+        """The launched step has finished on the GPU (False while it runs, or if it cannot tell):
+        input_wait stops waiting then, whatever the estimate said."""
+        event = self.inflight.event if self.inflight is not None else None
+        return event is not None and event.query()
 
     # -------------------------------------------------------------------- step
     def step(self) -> list[RequestOutput]:

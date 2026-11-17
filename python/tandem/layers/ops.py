@@ -67,9 +67,12 @@ class FlashInferOps:
 
     name = "flashinfer"
 
-    # residual add + RMSNorm through the Triton kernel up to this many rows (decode batches):
-    # 1.2-1.7x faster than FlashInfer's in a CUDA graph at 1-64 rows, hidden 1024-4096
-    # (benchmarks/bench_norm.py, p2-norm.jsonl, RTX 3090); larger batches (prefill) keep FlashInfer
+    # residual add + RMSNorm through the Triton kernel up to this many rows, inside CUDA graph
+    # capture (decode batches): 1.2-1.7x faster than FlashInfer's in a graph at 1-64 rows, hidden
+    # 1024-4096 (benchmarks/bench_norm.py, p2-norm.jsonl, RTX 3090). Eager steps (prefill, also
+    # of short prompts) keep FlashInfer: a Triton launch from Python costs more host time, which
+    # is the bottleneck of short prefills on small models (Qwen3-0.6B, 57 norms: about +1.5 ms
+    # of TTFT at ShareGPT concurrency 1)
     TRITON_NORM_MAX_ROWS = 64
 
     def __init__(self, fused_prologue: bool = False, small_batch_norm: bool = False) -> None:
@@ -110,7 +113,7 @@ class FlashInferOps:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # in place: residual <- x + residual, x <- rms_norm(residual)
         if (self._triton_norm is not None and x.dim() == 2 and x.shape[0] <= self.TRITON_NORM_MAX_ROWS
-                and x.stride(-1) == 1 and residual.stride(-1) == 1):
+                and x.stride(-1) == 1 and residual.stride(-1) == 1 and torch.cuda.is_current_stream_capturing()):
             self._triton_norm(x, residual, weight, eps)
         else:
             self._norm.fused_add_rmsnorm(x, residual, weight, eps)

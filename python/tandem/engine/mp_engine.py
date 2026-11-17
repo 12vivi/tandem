@@ -35,6 +35,9 @@ from tandem.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
+# input_wait checks this often whether the running step has finished on the GPU
+WAIT_SLICE = 0.0005
+
 
 def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
     """Entry point of the engine-core process."""
@@ -68,10 +71,18 @@ def _core_main(config: EngineConfig, inbox: Any, outbox: Any) -> None:
                     stopping = True
             return added
 
-        def wait_inputs(deadline: float) -> None:  # LLMEngine.input_wait: until a request or deadline
+        def wait_inputs(deadline: float) -> None:
+            """LLMEngine.input_wait: until a request arrives, the deadline passes, or the running
+            step has finished on the GPU (when its estimate runs long, waiting for the deadline
+            would leave the GPU idle and delay every request in the next step)."""
             while not stopping:
                 left = deadline - time.perf_counter()
-                if left <= 0 or not inbox.poll(left) or drain():
+                if left <= 0:
+                    return
+                if inbox.poll(min(left, WAIT_SLICE)):
+                    if drain():
+                        return
+                elif engine.inflight_done():
                     return
 
         if config.late_schedule:

@@ -312,7 +312,7 @@ def test_gemv_prologue_matches_unfused():
 def test_greedy_with_small_batch_gemv(tiny_path, tiny_fp32, monkeypatch, force):
     """Every decoder projection through the Triton GEMV (forced; "2" also folds the norms and
     SiLU-and-mul into the GEMV input): same greedy outputs as cuBLAS, within near-ties, in
-    CUDA-graph decode (batch buckets 1-8) and eager prefill."""
+    CUDA-graph decode (batch buckets 1-8; eager steps keep cuBLAS for the plain projections)."""
     pytest.importorskip("triton")
     ps = prompts(6, [5, 17, 40, 300, 9], vocab=VOCAB)
     plain_eng = make(tiny_path, small_batch_gemv=False)
@@ -589,3 +589,69 @@ def test_late_bound_schedule_during_long_prefill(tiny_path, monkeypatch):
     assert eng.prefill_tok_est == pytest.approx(0.001)
     assert [s.request.request_id for s in next_step.scheduled] == [added["rid"]]  # long's chunk waits
     assert long_id not in [s.request.request_id for s in next_step.scheduled]
+
+
+def test_small_batch_kernels_only_in_cuda_graphs():
+    """The Triton residual-add + RMSNorm and the decoder projections' GEMV run only inside CUDA
+    graph capture (decode steps); eager steps (prefill, also of short prompts) keep FlashInfer /
+    cuBLAS, whose launches cost less host time. lm_head (eager=True) keeps the GEMV."""
+    pytest.importorskip("triton")
+    from tandem.layers import triton_gemv
+    from tandem.layers.ops import make_ops
+
+    ops = make_ops("flashinfer", small_batch_norm=True)
+    calls = {"norm": 0, "gemv": 0}
+    real_norm, real_gemv = ops._triton_norm, triton_gemv.gemv
+
+    def norm(*args, **kwargs):
+        calls["norm"] += 1
+        return real_norm(*args, **kwargs)
+
+    def gemv(*args, **kwargs):
+        calls["gemv"] += 1
+        return real_gemv(*args, **kwargs)
+
+    ops._triton_norm = norm
+    triton_gemv.gemv = gemv
+    try:
+        torch.manual_seed(0)
+        h, n = 1024, 256
+        x, res = torch.randn(4, h, device="cuda", dtype=torch.bfloat16), torch.randn(4, h, device="cuda", dtype=torch.bfloat16)
+        wn = torch.rand(h, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(n, h, device="cuda", dtype=torch.bfloat16)
+        table = {(n, h, 4): (16, 128, 2, 4, 2)}
+        real_norm(x.clone(), res.clone(), wn, 1e-6)  # compile the Triton kernels outside capture
+        real_gemv(x, w, 16, 128, 2, 4, defer=2)
+        ref = torch.nn.functional.linear(x, w)
+        a, b = x.clone(), res.clone()
+        ops.fused_add_rms_norm(a, b, wn, 1e-6)
+        y = triton_gemv.linear(x, w, table, eager=False)
+        assert calls == {"norm": 0, "gemv": 0}  # eager: FlashInfer and cuBLAS
+        triton_gemv.linear(x, w, table)  # lm_head: the GEMV in eager steps too
+        assert calls["gemv"] == 1
+        xs, rs, xg = x.clone(), res.clone(), x.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ops.fused_add_rms_norm(xs, rs, wn, 1e-6)
+            yg = triton_gemv.linear(xg, w, table, eager=False)
+        assert calls == {"norm": 1, "gemv": 2}  # captured: the Triton kernels
+        xs.copy_(x)
+        rs.copy_(res)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.allclose(rs.float(), b.float()) and torch.allclose(xs.float(), a.float(), atol=2e-2, rtol=1e-2)
+        assert torch.allclose(yg.float(), ref.float(), atol=5e-2, rtol=2e-2) and torch.equal(y, ref)
+    finally:
+        triton_gemv.gemv = real_gemv
+
+
+def test_inflight_done_once_the_step_finished(tiny_path):
+    """inflight_done (input_wait stops waiting once it is True): False with nothing launched, True
+    once the launched step has finished on the GPU."""
+    eng = make(tiny_path)
+    assert not eng.inflight_done()
+    eng.add_request(prompts(41, [9], vocab=VOCAB)[0], GREEDY)
+    eng.step()  # launches the prefill; with overlap it is resolved by the next step
+    assert eng.inflight is not None
+    torch.cuda.synchronize()
+    assert eng.inflight_done()

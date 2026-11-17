@@ -282,9 +282,14 @@ def table_for(device: torch.device, model: nn.Module) -> dict[tuple[int, int, in
     return CONFIGS.get(torch.cuda.get_device_name(device), {})
 
 
-def linear(x: torch.Tensor, w: torch.Tensor, table: dict[tuple[int, int, int], Config]) -> torch.Tensor:
-    """F.linear(x, w) without bias, through the small-batch kernel where ``table`` says it wins."""
-    if x.dim() == 2 and x.shape[0] <= 8 and x.is_contiguous() and x.dtype == w.dtype:
+def linear(x: torch.Tensor, w: torch.Tensor, table: dict[tuple[int, int, int], Config],
+           eager: bool = True) -> torch.Tensor:
+    """F.linear(x, w) without bias, through the small-batch kernel where ``table`` says it wins.
+    ``eager=False``: only inside CUDA graph capture (the decoder projections: in eager steps, i.e.
+    prefills, a Triton launch costs more host time than cuBLAS's). lm_head keeps the default:
+    decode steps compute their logits eagerly, after the graph replay."""
+    if (x.dim() == 2 and x.shape[0] <= 8 and x.is_contiguous() and x.dtype == w.dtype
+            and (eager or torch.cuda.is_current_stream_capturing())):
         cfg = table.get((w.shape[0], w.shape[1], m_bucket(x.shape[0])))
         if cfg is not None:
             bn, bk, nw, ns, defer = cfg
@@ -293,7 +298,7 @@ def linear(x: torch.Tensor, w: torch.Tensor, table: dict[tuple[int, int, int], C
 
 
 def _forward(module: nn.Linear, table: dict, x: torch.Tensor) -> torch.Tensor:
-    return linear(x, module.weight, table)
+    return linear(x, module.weight, table, eager=False)
 
 
 def install(model: nn.Module, table: dict[tuple[int, int, int], Config]) -> int:
